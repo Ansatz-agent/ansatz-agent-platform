@@ -64,6 +64,7 @@ func (i *Introspector) Introspect(ctx context.Context, bearer string) (Principal
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("X-Ansatz-Internal-Token", i.internalSecret)
+	request.Header.Set("X-Forwarded-Proto", "https")
 
 	response, err := i.client.Do(request)
 	if err != nil {

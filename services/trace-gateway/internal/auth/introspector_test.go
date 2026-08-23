@@ -22,6 +22,9 @@ func TestIntrospectorReturnsExactActivePrincipal(t *testing.T) {
 		if got := r.Header.Get("X-Ansatz-Internal-Token"); got != testSecret {
 			t.Fatalf("internal header = %q", got)
 		}
+		if got := r.Header.Get("X-Forwarded-Proto"); got != "https" {
+			t.Fatalf("forwarded proto = %q", got)
+		}
 		body, _ := io.ReadAll(r.Body)
 		var request map[string]string
 		if err := json.Unmarshal(body, &request); err != nil {
