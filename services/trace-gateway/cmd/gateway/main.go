@@ -12,6 +12,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		runHealthCheck()
+		return
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	listenAddress := environment("TRACE_GATEWAY_LISTEN_ADDR", ":8080")
 	introspectionURL := required("AUTH_INTROSPECTION_URL", logger)
@@ -43,6 +47,18 @@ func main() {
 	logger.Info("trace gateway listening", "address", listenAddress)
 	if err := httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("trace gateway stopped", "error", "listen_failed")
+		os.Exit(1)
+	}
+}
+
+func runHealthCheck() {
+	client := &http.Client{Timeout: 2 * time.Second}
+	response, err := client.Get("http://127.0.0.1:8080/healthz")
+	if err != nil {
+		os.Exit(1)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
 		os.Exit(1)
 	}
 }
