@@ -15,6 +15,10 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	request := &collectortracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
 		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
 			kv("platform.user.id", "forged-resource"),
+			kv("langfuse.user.id", "forged-langfuse-user"),
+			kv("session.id", "forged-session"),
+			kv("langfuse.session.id", "forged-langfuse-session"),
+			kv("gen_ai.conversation.id", "forged-conversation"),
 			kv("prompt", "full prompt"),
 		}},
 		ScopeSpans: []*tracepb.ScopeSpans{{
@@ -50,15 +54,29 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	resource := request.ResourceSpans[0].Resource.Attributes
 	assertSingle(t, resource, "platform.user.id", "42")
 	assertSingle(t, resource, "user.id", "42")
+	assertSingle(t, resource, "langfuse.user.id", "42")
 	assertSingle(t, resource, "client.installation.id", principal.InstallationID)
 	assertSingle(t, resource, "hermes.session.id", "session-1")
+	assertSingle(t, resource, "session.id", "session-1")
+	assertSingle(t, resource, "langfuse.session.id", "session-1")
+	assertSingle(t, resource, "gen_ai.conversation.id", "session-1")
 	assertSingle(t, resource, "hermes.entrypoint", "voice")
 	assertSingle(t, resource, "hermes.run.id", "run-1")
 	assertSingle(t, resource, "telemetry.schema.version", "1")
 	assertSingle(t, resource, "trace.gateway.request.id", "gateway-request-1")
 
 	all := request.String()
-	for _, forged := range []string{"forged-resource", "forged-scope", "forged-span", "forged-event", "Bearer secret"} {
+	for _, forged := range []string{
+		"forged-resource",
+		"forged-langfuse-user",
+		"forged-session",
+		"forged-langfuse-session",
+		"forged-conversation",
+		"forged-scope",
+		"forged-span",
+		"forged-event",
+		"Bearer secret",
+	} {
 		if strings.Contains(all, forged) {
 			t.Fatalf("forged/sensitive value %q survived: %s", forged, all)
 		}
