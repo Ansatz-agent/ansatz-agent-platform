@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-08-23T08:18:18Z",
+  "deployment": {
+    "host_alias": "hermes",
+    "project": "ansatz-voice-trace-20260823",
+    "dashboard_url": "https://trace.c2sml.cn/"
+  },
+  "administrator": {
+    "user_id": "cmt5ild6p0002qk0634vxvscd",
+    "email": "trace-admin-20260823-d4aafd19@c2sml.cn",
+    "platform_admin": true,
+    "total_user_count": 1,
+    "enabled_platform_admin_count": 1
+  },
+  "pre_change_backup": {
+    "remote_path": "/root/ansatz-agent/voice-trace-20260823/backups/langfuse-pre-admin-20260823T081741Z.sql",
+    "sha256": "7a34be3aedba34c3515e290373765f762f816cdfae6ad140ca7fd6f7a8e8d68",
+    "mode": "0600",
+    "size_bytes": 667420
+  },
+  "credential_files": {
+    "local_path": "/Users/yuxiaoy/Projects/Ansatz-agent/tmp/ansatz-platform-trace-ingest/.secrets/voice-trace/langfuse-admin-20260823.txt",
+    "local_mode": "0600",
+    "remote_path": "/root/ansatz-agent/voice-trace-20260823/secrets/langfuse-admin.txt",
+    "remote_mode": "0600"
+  },
+  "secret_values_recorded": false,
+  "browser_login_verified": false
+}
