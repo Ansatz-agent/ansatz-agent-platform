@@ -63,6 +63,14 @@ func Canonicalize(
 					continue
 				}
 				span.Attributes = withoutCanonical(span.Attributes)
+				span.Attributes = append(
+					span.Attributes,
+					stringAttribute("user.id", principal.UserID),
+					stringAttribute("langfuse.user.id", principal.UserID),
+					stringAttribute("session.id", headers.SessionID),
+					stringAttribute("langfuse.session.id", headers.SessionID),
+					stringAttribute("gen_ai.conversation.id", headers.SessionID),
+				)
 				for _, event := range span.Events {
 					if event != nil {
 						event.Attributes = withoutCanonical(event.Attributes)

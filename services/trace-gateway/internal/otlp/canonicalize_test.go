@@ -65,6 +65,13 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	assertSingle(t, resource, "telemetry.schema.version", "1")
 	assertSingle(t, resource, "trace.gateway.request.id", "gateway-request-1")
 
+	span := request.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	assertSingle(t, span.Attributes, "user.id", "42")
+	assertSingle(t, span.Attributes, "langfuse.user.id", "42")
+	assertSingle(t, span.Attributes, "session.id", "session-1")
+	assertSingle(t, span.Attributes, "langfuse.session.id", "session-1")
+	assertSingle(t, span.Attributes, "gen_ai.conversation.id", "session-1")
+
 	all := request.String()
 	for _, forged := range []string{
 		"forged-resource",
