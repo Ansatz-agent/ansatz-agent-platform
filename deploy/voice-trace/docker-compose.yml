@@ -1,0 +1,227 @@
+services:
+  auth-service:
+    image: ${AUTH_SERVICE_IMAGE}
+    restart: unless-stopped
+    environment:
+      DJANGO_ENV: production
+      DJANGO_DEBUG: "0"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_ALLOWED_HOSTS: c2sml.cn,auth-service,localhost,127.0.0.1
+      DJANGO_CSRF_TRUSTED_ORIGINS: https://c2sml.cn
+      DJANGO_SCRIPT_NAME: /agent
+      DJANGO_SESSION_COOKIE_NAME: agent_history_sessionid
+      DJANGO_CSRF_COOKIE_NAME: agent_history_csrftoken
+      DJANGO_DB_PATH: /data/db.sqlite3
+      TRACE_GATEWAY_INTERNAL_SECRET: ${TRACE_GATEWAY_INTERNAL_SECRET}
+    volumes:
+      - "${DEPLOY_ROOT}/data/auth:/data"
+    networks:
+      - proxy
+      - auth-gateway
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+  trace-gateway:
+    image: ${TRACE_GATEWAY_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      - auth-service
+      - langfuse-web
+    environment:
+      TRACE_GATEWAY_LISTEN_ADDR: :8080
+      AUTH_INTROSPECTION_URL: http://auth-service:8000/internal/trace-token/introspect/
+      TRACE_GATEWAY_INTERNAL_SECRET: ${TRACE_GATEWAY_INTERNAL_SECRET}
+      LANGFUSE_OTLP_TRACES_URL: http://langfuse-web:3000/api/public/otel/v1/traces
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+    networks:
+      - proxy
+      - auth-gateway
+      - gateway-langfuse
+    healthcheck:
+      test: ["CMD", "/trace-gateway", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  langfuse-worker:
+    image: ${LANGFUSE_WORKER_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - minio
+      - redis
+      - clickhouse
+    environment: &langfuse-environment
+      NEXTAUTH_URL: https://trace.c2sml.cn
+      DATABASE_URL: ${DATABASE_URL}
+      SALT: ${SALT}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: "false"
+      AUTH_DISABLE_SIGNUP: "true"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      NODE_OPTIONS: --max-old-space-size=1536
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${REDIS_AUTH}
+      REDIS_TLS_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: langfuse
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: exports/
+      LANGFUSE_S3_BATCH_EXPORT_REGION: auto
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: ${LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID}
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: ${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY}
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+    networks:
+      - langfuse-data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):3030/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  langfuse-web:
+    image: ${LANGFUSE_WEB_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - minio
+      - redis
+      - clickhouse
+    environment:
+      <<: *langfuse-environment
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+    networks:
+      - proxy
+      - gateway-langfuse
+      - langfuse-data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):3000/api/public/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  clickhouse:
+    image: ${CLICKHOUSE_IMAGE}
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - "${DEPLOY_ROOT}/data/clickhouse:/var/lib/clickhouse"
+      - "${DEPLOY_ROOT}/data/clickhouse-logs:/var/log/clickhouse-server"
+    networks:
+      - langfuse-data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  minio:
+    image: ${MINIO_IMAGE}
+    restart: unless-stopped
+    command: ["server", "--address", ":9000", "--console-address", ":9001", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - "${DEPLOY_ROOT}/data/minio:/data"
+    networks:
+      - langfuse-data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  redis:
+    image: ${REDIS_IMAGE}
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_AUTH}", "--maxmemory-policy", "noeviction"]
+    environment:
+      REDIS_AUTH: ${REDIS_AUTH}
+    volumes:
+      - "${DEPLOY_ROOT}/data/redis:/data"
+    networks:
+      - langfuse-data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_AUTH\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - "${DEPLOY_ROOT}/data/postgres:/var/lib/postgresql/data"
+    networks:
+      - langfuse-data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+networks:
+  proxy:
+    external: true
+    name: ${NPM_NETWORK}
+  auth-gateway:
+    internal: true
+  gateway-langfuse:
+    internal: true
+  langfuse-data:
+    internal: true
