@@ -1,0 +1,25 @@
+schema_version: 1
+components:
+  agent_server:
+    path: ../agent-langfuse-server
+    repository: git@github.com:Ansatz-agent/agent-langfuse-server.git
+    branch: main
+    commit: 62751446149b702b419a9292ddfc2280cdf74b8c
+  auth_service_source:
+    path: ../agent-langfuse-server/auth-service
+    repository: null
+    source_host: hermes
+    source_path: /opt/agent-history-portal
+    branch: feature/token-usage-dashboard
+    commit: 8b1b1bfaf8b2ab702b9f28abee90d1bf6bb246e0
+    archive_sha256: 4c6fa11dd090768d77b5a335080254fd4aebd0dcd2c34f1fec36fc58a6389513
+  hermes_reference:
+    path: ../hermes-agent
+    repository: git@github.com:NousResearch/hermes-agent.git
+    branch: main
+    commit: fc7523ca31eeb6eff9114afe384c2cf6380359df
+  trace_runtime:
+    path: ../nemo-relay
+    repository: git@github.com:Ansatz-agent/nemo-relay.git
+    branch: main
+    commit: 39885b04174be74a7c8fe7aad55686722e815dc8

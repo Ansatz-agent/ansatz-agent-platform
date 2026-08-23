@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-23",
+  "source": {
+    "host": "hermes",
+    "path": "/opt/agent-history-portal",
+    "branch": "feature/token-usage-dashboard",
+    "commit": "8b1b1bfaf8b2ab702b9f28abee90d1bf6bb246e0",
+    "remote_origin": null,
+    "worktree_clean": true
+  },
+  "archive": {
+    "method": "git archive HEAD",
+    "prefix": "auth-service/",
+    "filename": "agent-history-portal-8b1b1bf.tar.gz",
+    "sha256": "4c6fa11dd090768d77b5a335080254fd4aebd0dcd2c34f1fec36fc58a6389513",
+    "manifest_sha256": "78279ccf6a671980b0ba20bede751af16633051e4e16b6ef80b1331eebd962cf",
+    "tracked_file_count": 79,
+    "symlink_count": 0
+  },
+  "custody": {
+    "destination_repository": "agent-langfuse-server",
+    "destination_branch": "feature/auth-trace-ingest",
+    "destination_path": "auth-service",
+    "excluded_by_git_archive": [
+      ".git",
+      "untracked environment files",
+      "runtime databases",
+      "media and uploads",
+      "logs and caches",
+      "certificates and private keys",
+      "host owner state"
+    ],
+    "allowed_template": ".env.example",
+    "validation": {
+      "archive_members_relative": true,
+      "archive_members_non_link": true,
+      "secret_path_scan_clean": true,
+      "local_hash_matches_remote": true
+    }
+  }
+}
