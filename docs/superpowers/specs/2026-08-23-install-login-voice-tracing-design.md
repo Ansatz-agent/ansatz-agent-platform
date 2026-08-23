@@ -237,7 +237,6 @@ Response `201` for a new token and `200` for rotation:
 ```json
 {
   "access_token": "opaque-base64url",
-  "token_type": "Bearer",
   "expires_in": 900,
   "expires_at": "RFC3339",
   "installation_id": "uuid-v4"
