@@ -16,7 +16,7 @@
 - Client branch is exactly `feature/install-login-voice-trace` in the existing isolated worktree.
 - Product identity is `Ansatz Voice Trace Client` with app ID `cn.c2sml.ansatz.voice-trace-client` and scheme `ansatz-voice-trace`.
 - Product runtime roots are `~/.ansatz-voice-trace-client` and `%LOCALAPPDATA%\AnsatzVoiceTraceClient`; existing Hermes roots are never adopted.
-- Upload endpoint is `POST https://api.c2sml.cn/v1/traces`; admin UI is `https://trace.c2sml.cn`.
+- Upload endpoint is `POST https://c2sml.cn/trace-ingest/v1/traces`; admin UI is `https://c2sml.cn/langfuse/`.
 - Upload tokens are opaque, upload-only, introspected, and expire after 900 seconds.
 - Gateway request limit is 8 MiB; queue limit is 128 batches or 32 MiB; item lifetime is 15 minutes; shutdown flush is 3 seconds.
 - Full user/model/tool semantics are uploaded; credentials and raw audio are not.
@@ -530,8 +530,7 @@ Commit in the platform repository as `feat: add authenticated OTLP trace gateway
 **Files:**
 - Create: `ansatz-agent-platform/deploy/voice-trace/docker-compose.yml`
 - Create: `ansatz-agent-platform/deploy/voice-trace/.env.example`
-- Create: `ansatz-agent-platform/deploy/voice-trace/nginx/api.c2sml.cn.conf`
-- Create: `ansatz-agent-platform/deploy/voice-trace/nginx/trace.c2sml.cn.conf`
+- Create: `ansatz-agent-platform/deploy/voice-trace/nginx/server_proxy.conf`
 - Create: `ansatz-agent-platform/tests/test_voice_trace_compose_contract.py`
 - Create: `ansatz-agent-platform/tests/test_voice_trace_proxy_contract.py`
 - Create: `ansatz-agent-platform/scripts/bootstrap-voice-trace-secrets.sh`
@@ -643,28 +642,29 @@ After HTTPS exists, use the dedicated account in a real browser session. Evidenc
 
 ---
 
-### Task 12: Provision exact public DNS/TLS routes
+### Task 12: Provision exact same-origin HTTPS routes
 
 **Files:**
-- Modify only external DNS records for `api.c2sml.cn` and `trace.c2sml.cn`
-- Add exact NPM proxy hosts using the tested configuration
+- Add the exact NPM `server_proxy.conf` custom include under the existing `c2sml.cn` proxy host
+- Rebuild Langfuse Web with `NEXT_PUBLIC_BASE_PATH=/langfuse`
 - Update: `ansatz-agent-platform/docs/evidence/2026-08-23-public-https.json`
 
 **Interfaces:**
-- Both records resolve to the existing c2sml public host.
-- Separate valid certificates cover each hostname.
+- `POST /trace-ingest/v1/traces` resolves only to Gateway `/v1/traces`.
+- `/langfuse/` resolves only to the base-path-aware Langfuse Web service.
+- The existing valid `c2sml.cn` certificate and unrelated root routes remain unchanged.
 
-- [ ] **Step 1: Recheck DNS and certificates**
+- [ ] **Step 1: Recheck the existing root certificate and NPM include point**
 
-Use independent external resolution and `rtk proxy curl`; expected current RED is DNS failure.
+Use independent external resolution and `rtk proxy curl`; verify the current root site and `/agent` before mutation.
 
-- [ ] **Step 2: Create only the two approved DNS records**
+- [ ] **Step 2: Build and verify the prefixed Langfuse Web image**
 
-Use available registrar credentials/UI if accessible. Do not change root, mail, or unrelated records. If no registrar authority is available, retain the exact prepared values and continue all non-public work; this is the only external infrastructure blocker.
+Build from the locked Langfuse source with `NEXT_PUBLIC_BASE_PATH=/langfuse`, transfer by hash through the existing L40S build-only route, and preserve the Worker/source commit and persistent data.
 
-- [ ] **Step 3: Add NPM hosts and request certificates**
+- [ ] **Step 3: Install the tested NPM custom include**
 
-Route API to Gateway and Trace to Langfuse; preserve the current root-domain host. Apply tested advanced settings, then reload Nginx and inspect exact config.
+Back up any existing custom include, install only the tested same-origin locations, run `nginx -t`, reload Nginx, and prove the root site plus `/agent` remain intact.
 
 - [ ] **Step 4: Verify external HTTPS behavior**
 

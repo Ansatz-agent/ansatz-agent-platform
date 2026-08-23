@@ -12,8 +12,8 @@ The selected design is:
 1. ship the complete Hermes runtime inside each installer and prepare it locally before showing account login;
 2. keep `https://c2sml.cn/agent` as the client account authority;
 3. extend that authority with short-lived opaque Trace upload tokens and server-side introspection;
-4. send OTLP/HTTP protobuf through a dedicated Trace Gateway at `https://api.c2sml.cn/v1/traces`;
-5. let only one dedicated Langfuse administrator use `https://trace.c2sml.cn`;
+4. send OTLP/HTTP protobuf through a dedicated Trace Gateway at `https://c2sml.cn/trace-ingest/v1/traces`;
+5. let only one dedicated Langfuse administrator use `https://c2sml.cn/langfuse/`;
 6. keep full semantic Trace content while redacting credentials and raw microphone audio;
 7. produce macOS arm64 and Windows x64 artifacts through the repository's official local Electron Builder pipelines from the same clean commit.
 
@@ -100,7 +100,7 @@ Nginx Proxy Manager currently serves only `c2sml.cn`. Its active certificate cov
 - `trace.c2sml.cn` does not resolve;
 - no certificate exists for either required subdomain.
 
-The implementation may prepare and deploy loopback/internal services and exact reverse-proxy configuration, but public acceptance for the two subdomains requires external DNS A/AAAA records and successful certificate issuance. It must not silently replace the approved URLs with unrelated paths.
+On 2026-08-23 the user explicitly approved a same-origin fallback if the two new DNS records could not be provisioned. The selected public contract therefore reuses the existing valid `c2sml.cn` certificate: `/trace-ingest/v1/traces` routes only to Gateway and `/langfuse/` routes only to a Langfuse Web image built with `NEXT_PUBLIC_BASE_PATH=/langfuse`. This removes the new-DNS dependency without merging the auth, ingestion, and administrator security boundaries.
 
 ## 5. Alternatives considered
 
@@ -134,7 +134,7 @@ Ansatz Voice Trace Client
         |
         | OTLP/HTTP protobuf over HTTPS
         v
-api.c2sml.cn/v1/traces
+c2sml.cn/trace-ingest/v1/traces
   Trace Gateway container
     - request limits and bearer extraction
     - auth-service introspection
@@ -144,10 +144,10 @@ api.c2sml.cn/v1/traces
         |
         | Basic project credential on private network only
         v
-Langfuse /api/public/otel/v1/traces
+Langfuse /langfuse/api/public/otel/v1/traces
         |
         v
-trace.c2sml.cn
+c2sml.cn/langfuse/
   one dedicated administrator
 ```
 
@@ -285,7 +285,7 @@ All invalid, expired, logged-out, revoked, disabled-user, wrong-scope, and wrong
 
 ### 10.1 Public ingestion
 
-`POST https://api.c2sml.cn/v1/traces`
+`POST https://c2sml.cn/trace-ingest/v1/traces`
 
 Required headers:
 
@@ -382,8 +382,8 @@ All production runtime services run on SSH alias `hermes`; L40S is only a build 
 
 ```text
 Nginx Proxy Manager :443
-  api.c2sml.cn   -> 127.0.0.1:<gateway-port>
-  trace.c2sml.cn -> 127.0.0.1:3100
+  c2sml.cn/trace-ingest/v1/traces -> trace-gateway:8080/v1/traces
+  c2sml.cn/langfuse/               -> langfuse-web:3000/langfuse/
 
 private Compose networks
   trace-gateway -> agent-history-web:8000 introspection
@@ -402,9 +402,9 @@ Proxy requirements:
 - allow 8 MiB bodies and a 15-second upstream timeout;
 - apply per-source connection and request limits;
 - redirect HTTP to HTTPS;
-- enable HSTS only after both subdomain certificates are valid.
+- reuse the existing valid root-domain TLS certificate and HSTS policy.
 
-Langfuse uses `NEXTAUTH_URL=https://trace.c2sml.cn`. Public signup is disabled. Direct public access to internal OTLP, health, database, object storage, queue, or worker ports is prohibited.
+Langfuse uses `NEXTAUTH_URL=https://c2sml.cn/langfuse` and is built and run with `NEXT_PUBLIC_BASE_PATH=/langfuse`. Public signup is disabled. Direct public access to internal health, database, object storage, queue, or worker ports is prohibited; the prefixed Langfuse OTLP route remains protected by its server-only project credentials and is not used by clients.
 
 ## 14. Administrator model and credential handoff
 
@@ -455,7 +455,7 @@ The live service is not replaced until its regression tests pass, database backu
 - Logout/account switch invalidates the whole auth epoch and discards unsent old-user batches.
 - Malformed OTLP, forged identity fields, wrong schema, and raw audio payloads are rejected before Langfuse.
 - Langfuse migration/health failure preserves existing data and old containers for rollback; no volume deletion or `down -v` is allowed.
-- DNS/certificate absence prevents the public-HTTPS completion claim but does not prevent local/internal implementation and testing.
+- A same-origin route failure preserves the existing root site and `/agent`; rollback removes only the task-owned custom include and restores the prior Langfuse image/URL.
 
 ## 17. Test strategy
 
@@ -527,7 +527,7 @@ All behavior changes follow RED -> observed expected failure -> minimal GREEN ->
 3. User A performs a real text conversation with one safe read-only tool call; export is automatic.
 4. User A performs a Voice conversation when microphone/model prerequisites are available; the Trace contains transcript and no audio bytes.
 5. Logout and sign in as user B; perform a different text/tool conversation without identity carryover.
-6. Dedicated admin logs in at `https://trace.c2sml.cn`, locates all new Traces, and validates full input, response, tool args/result, Voice metadata, and canonical identity fields.
+6. Dedicated admin logs in at `https://c2sml.cn/langfuse/`, locates all new Traces, and validates full input, response, tool args/result, Voice metadata, and canonical identity fields.
 7. Verify no duplicate model/tool calls, no secrets, and persistence after controlled service restart.
 
 ## 18. Rollout
@@ -537,7 +537,7 @@ All behavior changes follow RED -> observed expected failure -> minimal GREEN ->
 3. Implement auth token models/endpoints against the sanitized source snapshot and run regression tests.
 4. Implement and container-test Gateway plus internal Langfuse forwarding.
 5. Deploy auth/Gateway/Langfuse changes on private/loopback interfaces and verify synthetic multi-user ingestion.
-6. Add DNS records and issue certificates for `api.c2sml.cn` and `trace.c2sml.cn`; enable exact Nginx routes.
+6. Install the tested NPM `server_proxy.conf` include for the two same-origin HTTPS paths and verify the existing certificate.
 7. Create and browser-test the dedicated Langfuse administrator.
 8. Build both artifacts from one clean client commit through official local scripts.
 9. Install the Mac artifact and run the two-user packaged-app E2E.
@@ -550,7 +550,7 @@ All behavior changes follow RED -> observed expected failure -> minimal GREEN ->
 - Auth service: restore the previous image and pre-migration database backup. Token tables are additive; rollback ignores them.
 - Langfuse: restore prior `NEXTAUTH_URL`/proxy route and image definitions without deleting volumes.
 - Administrator: restore the prior enabled-state inventory from the reversible record if migration validation fails.
-- DNS: remove only the two task-created records after proxy rollback; no other c2sml records change.
+- Public routing: remove only the task-owned `server_proxy.conf` include after proxy rollback; no DNS record or unrelated c2sml route changes.
 
 ## 20. Acceptance criteria
 
@@ -563,7 +563,7 @@ Completion requires current evidence for every item:
 5. Auth service issues, refreshes, introspects, and revokes upload-only opaque tokens without secret leakage.
 6. Gateway accepts valid OTLP, rejects invalid access, overwrites trusted identity, enforces limits, and forwards with server-only Langfuse keys.
 7. Two users/two installations are distinguishable to the administrator and cannot read Langfuse.
-8. Public HTTPS endpoints are live at the exact approved hosts with valid certificates.
+8. Public HTTPS endpoints are live at the exact approved same-origin paths with the valid `c2sml.cn` certificate.
 9. The deployment has exactly one enabled dedicated Langfuse administrator; credential handoff is owner-only and browser-tested.
 10. macOS arm64 DMG and Windows x64 EXE come from the same clean commit through official local tooling and are copied to Downloads without overwrite, with byte size and SHA-256.
 11. The newly installed Mac app coexists with existing Hermes apps/data and completes a real conversation whose full Trace is opened in the public Dashboard.
@@ -583,4 +583,4 @@ No implementation choice remains unspecified:
 - raw audio is excluded;
 - one dedicated admin is the only enabled Langfuse user at acceptance.
 
-External infrastructure still required for final public acceptance is precisely identified: DNS A/AAAA records for `api.c2sml.cn` and `trace.c2sml.cn`, followed by certificate issuance. The absence of those records is a factual deployment dependency, not an architectural ambiguity and not permission to change the approved endpoint names.
+The user-approved same-origin fallback resolves the earlier DNS dependency. No new DNS record or certificate is required; final acceptance instead requires exact-path proxy tests, a Langfuse image built with `/langfuse`, and real external HTTPS verification on `c2sml.cn`.

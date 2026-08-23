@@ -14,16 +14,18 @@ services:
       DJANGO_DB_PATH: /data/db.sqlite3
       TRACE_GATEWAY_INTERNAL_SECRET: ${TRACE_GATEWAY_INTERNAL_SECRET}
     volumes:
-      - "${DEPLOY_ROOT}/data/auth:/data"
+      - "/var/lib/agent-history:/data"
     networks:
-      - proxy
-      - auth-gateway
+      service:
+        ipv4_address: 10.89.2.32
+        aliases:
+          - agent-history-web
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+        - "import urllib.request; request=urllib.request.Request('http://127.0.0.1:8000/healthz', headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(request, timeout=2)"
       interval: 10s
       timeout: 3s
       retries: 12
@@ -39,13 +41,12 @@ services:
       TRACE_GATEWAY_LISTEN_ADDR: :8080
       AUTH_INTROSPECTION_URL: http://auth-service:8000/internal/trace-token/introspect/
       TRACE_GATEWAY_INTERNAL_SECRET: ${TRACE_GATEWAY_INTERNAL_SECRET}
-      LANGFUSE_OTLP_TRACES_URL: http://langfuse-web:3000/api/public/otel/v1/traces
+      LANGFUSE_OTLP_TRACES_URL: http://langfuse-web:3000/langfuse/api/public/otel/v1/traces
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
     networks:
-      - proxy
-      - auth-gateway
-      - gateway-langfuse
+      service:
+        ipv4_address: 10.89.2.39
     healthcheck:
       test: ["CMD", "/trace-gateway", "healthcheck"]
       interval: 10s
@@ -62,7 +63,8 @@ services:
       - redis
       - clickhouse
     environment: &langfuse-environment
-      NEXTAUTH_URL: https://trace.c2sml.cn
+      NEXTAUTH_URL: https://c2sml.cn/langfuse
+      NEXT_PUBLIC_BASE_PATH: /langfuse
       DATABASE_URL: ${DATABASE_URL}
       SALT: ${SALT}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
@@ -102,7 +104,7 @@ services:
       LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: ${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY}
       LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
     networks:
-      - langfuse-data
+      - service
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):3030/api/health"]
       interval: 30s
@@ -131,11 +133,10 @@ services:
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME}
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
     networks:
-      - proxy
-      - gateway-langfuse
-      - langfuse-data
+      service:
+        ipv4_address: 10.89.2.38
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):3000/api/public/health"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):3000/langfuse/api/public/health"]
       interval: 30s
       timeout: 10s
       retries: 10
@@ -153,7 +154,7 @@ services:
       - "${DEPLOY_ROOT}/data/clickhouse:/var/lib/clickhouse"
       - "${DEPLOY_ROOT}/data/clickhouse-logs:/var/log/clickhouse-server"
     networks:
-      - langfuse-data
+      - service
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8123/ping"]
       interval: 5s
@@ -164,14 +165,17 @@ services:
   minio:
     image: ${MINIO_IMAGE}
     restart: unless-stopped
-    command: ["server", "--address", ":9000", "--console-address", ":9001", "/data"]
+    entrypoint: sh
+    # Create the Langfuse bucket before starting the service, matching the
+    # upstream Langfuse self-hosted Compose deployment.
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - "${DEPLOY_ROOT}/data/minio:/data"
     networks:
-      - langfuse-data
+      - service
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -188,7 +192,7 @@ services:
     volumes:
       - "${DEPLOY_ROOT}/data/redis:/data"
     networks:
-      - langfuse-data
+      - service
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_AUTH\" ping | grep -q PONG"]
       interval: 5s
@@ -207,7 +211,7 @@ services:
     volumes:
       - "${DEPLOY_ROOT}/data/postgres:/var/lib/postgresql/data"
     networks:
-      - langfuse-data
+      - service
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\""]
       interval: 5s
@@ -216,12 +220,8 @@ services:
       start_period: 10s
 
 networks:
-  proxy:
-    external: true
-    name: ${NPM_NETWORK}
-  auth-gateway:
-    internal: true
-  gateway-langfuse:
-    internal: true
-  langfuse-data:
-    internal: true
+  service:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.89.2.0/24

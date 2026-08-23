@@ -55,7 +55,7 @@ admin_email="$admin_username@c2sml.cn"
   printf '%s\n' \
     'DEPLOY_ROOT=/root/ansatz-agent/voice-trace-20260823' \
     'NPM_NETWORK=nginx-proxy-manager_default' \
-    'AUTH_SERVICE_IMAGE=localhost/ansatz-auth-service:2c2326876499' \
+    'AUTH_SERVICE_IMAGE=localhost/ansatz-auth-service:77959189e16a' \
     'TRACE_GATEWAY_IMAGE=localhost/ansatz-trace-gateway:615a97a0f2dd' \
     'LANGFUSE_WEB_IMAGE=localhost/ansatz-langfuse-web@sha256:1c50837be0ad92bbfec54e0054af5da8e4b7027c502a10b8acd33eaea0320480' \
     'LANGFUSE_WORKER_IMAGE=localhost/ansatz-langfuse-worker@sha256:de5b3059cce72312b6a9552748f811381df941c1b57e6e0762410a9848021349' \
