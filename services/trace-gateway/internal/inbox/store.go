@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ type BoltStore struct {
 	syncFn           func() error
 	writeMu          sync.Mutex
 	closed           bool
+	pageSize         int
 }
 
 type storedBatch struct {
@@ -89,6 +91,7 @@ func Open(path string, options Options) (*BoltStore, error) {
 		db:               db,
 		receiptRetention: options.ReceiptRetention,
 		now:              options.Now,
+		pageSize:         db.Info().PageSize,
 	}
 	store.syncFn = db.Sync
 	if options.StorageGuard != nil {
@@ -127,10 +130,6 @@ func (s *BoltStore) Accept(ctx context.Context, env Envelope) (AcceptResult, err
 	if s.closed {
 		return AcceptResult{}, ErrClosed
 	}
-	if err := s.storageGuard.Check(int64(len(env.Payload))); err != nil {
-		return AcceptResult{}, err
-	}
-
 	var result AcceptResult
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		if err := ctx.Err(); err != nil {
@@ -163,6 +162,9 @@ func (s *BoltStore) Accept(ctx context.Context, env Envelope) (AcceptResult, err
 			Outcome: ReceiptAccepted, AcceptedAt: acceptedAt, State: receiptPending,
 		})
 		if err != nil {
+			return err
+		}
+		if err := s.storageGuard.Check(projectedAcceptanceGrowth(s.pageSize, key, batchBytes, receiptBytes)); err != nil {
 			return err
 		}
 		fifoKey := sequenceKey(sequence)
@@ -225,12 +227,12 @@ func (s *BoltStore) PeekEligible(ctx context.Context, now time.Time) (*Batch, er
 	return result, err
 }
 
-func (s *BoltStore) MarkRetry(ctx context.Context, batchID string, retry Retry) error {
+func (s *BoltStore) MarkRetry(ctx context.Context, accountID, batchID string, retry Retry) error {
 	if retry.NextRetry.IsZero() {
 		return errors.New("next retry time is required")
 	}
 	return s.updateAndSync(ctx, func(tx *bolt.Tx) error {
-		key, batch, err := findBatch(tx, batchID)
+		key, batch, err := lookupBatch(tx, accountID, batchID)
 		if err != nil {
 			return err
 		}
@@ -245,9 +247,13 @@ func (s *BoltStore) MarkRetry(ctx context.Context, batchID string, retry Retry) 
 	})
 }
 
-func (s *BoltStore) MarkDelivered(ctx context.Context, batchID string, deliveredAt time.Time) error {
+func (s *BoltStore) MarkDelivered(ctx context.Context, accountID, batchID string, deliveredAt time.Time) error {
+	if deliveredAt.IsZero() {
+		deliveredAt = s.now()
+	}
+	deliveredAt = deliveredAt.UTC()
 	return s.updateAndSync(ctx, func(tx *bolt.Tx) error {
-		key, batch, err := findBatch(tx, batchID)
+		key, batch, err := lookupBatch(tx, accountID, batchID)
 		if err != nil {
 			return err
 		}
@@ -259,18 +265,22 @@ func (s *BoltStore) MarkDelivered(ctx context.Context, batchID string, delivered
 		}
 		return updateReceipt(tx, key, func(receipt *storedReceipt) {
 			receipt.State = receiptDelivered
-			receipt.CompletedAt = deliveredAt.UTC()
+			receipt.CompletedAt = deliveredAt
 			receipt.ErrorClass = ""
 		})
 	})
 }
 
-func (s *BoltStore) MarkQuarantined(ctx context.Context, batchID, errorClass string, quarantinedAt time.Time) error {
+func (s *BoltStore) MarkQuarantined(ctx context.Context, accountID, batchID, errorClass string, quarantinedAt time.Time) error {
 	if errorClass == "" {
 		return errors.New("quarantine error class is required")
 	}
+	if quarantinedAt.IsZero() {
+		quarantinedAt = s.now()
+	}
+	quarantinedAt = quarantinedAt.UTC()
 	return s.updateAndSync(ctx, func(tx *bolt.Tx) error {
-		key, batch, err := findBatch(tx, batchID)
+		key, batch, err := lookupBatch(tx, accountID, batchID)
 		if err != nil {
 			return err
 		}
@@ -289,7 +299,7 @@ func (s *BoltStore) MarkQuarantined(ctx context.Context, batchID, errorClass str
 		}
 		return updateReceipt(tx, key, func(receipt *storedReceipt) {
 			receipt.State = receiptQuarantined
-			receipt.CompletedAt = quarantinedAt.UTC()
+			receipt.CompletedAt = quarantinedAt
 			receipt.ErrorClass = errorClass
 		})
 	})
@@ -359,31 +369,17 @@ func (s *BoltStore) updateAndSync(ctx context.Context, update func(*bolt.Tx) err
 	return s.syncFn()
 }
 
-func findBatch(tx *bolt.Tx, batchID string) ([]byte, storedBatch, error) {
-	var foundKey []byte
-	var found storedBatch
-	err := tx.Bucket(batchesBucket).ForEach(func(key, value []byte) error {
-		batch, err := decodeBatch(value)
-		if err != nil {
-			return err
-		}
-		if batch.BatchID != batchID {
-			return nil
-		}
-		if foundKey != nil {
-			return errors.New("ambiguous trace batch ID")
-		}
-		foundKey = append([]byte(nil), key...)
-		found = batch
-		return nil
-	})
+func lookupBatch(tx *bolt.Tx, accountID, batchID string) ([]byte, storedBatch, error) {
+	key := receiptKey(accountID, batchID)
+	encoded := tx.Bucket(batchesBucket).Get(key)
+	if encoded == nil {
+		return nil, storedBatch{}, ErrBatchNotFound
+	}
+	batch, err := decodeBatch(encoded)
 	if err != nil {
 		return nil, storedBatch{}, err
 	}
-	if foundKey == nil {
-		return nil, storedBatch{}, ErrBatchNotFound
-	}
-	return foundKey, found, nil
+	return key, batch, nil
 }
 
 func updateReceipt(tx *bolt.Tx, key []byte, update func(*storedReceipt)) error {
@@ -436,6 +432,31 @@ func sequenceKey(sequence uint64) []byte {
 	return key
 }
 
+const (
+	bboltLeafElementBytes    = int64(16)
+	bboltAcceptanceSafePages = int64(32)
+)
+
+// projectedAcceptanceGrowth accounts for the exact JSON-encoded batch and
+// receipt (including base64 payload expansion), all three bucket key/value
+// pairs, and bbolt leaf-element overhead. It rounds data to whole pages,
+// doubles those pages for copy-on-write leaf splits, then adds thirty-two pages
+// for branch splits and freelist growth. Admission may therefore reject early,
+// but never treats raw payload length as the expected on-disk growth.
+func projectedAcceptanceGrowth(pageSize int, key, batch, receipt []byte) int64 {
+	if pageSize <= 0 {
+		return math.MaxInt64
+	}
+	recordBytes := int64(len(batch)+len(receipt)+3*len(key)+8) + 3*bboltLeafElementBytes
+	pageBytes := int64(pageSize)
+	dataPages := (recordBytes + pageBytes - 1) / pageBytes
+	projectedPages := 2*dataPages + bboltAcceptanceSafePages
+	if projectedPages > math.MaxInt64/pageBytes {
+		return math.MaxInt64
+	}
+	return projectedPages * pageBytes
+}
+
 func decodeBatch(encoded []byte) (storedBatch, error) {
 	var batch storedBatch
 	if err := json.Unmarshal(encoded, &batch); err != nil {
@@ -458,31 +479,52 @@ func cloneEnvelope(env Envelope) Envelope {
 }
 
 type fileStorageGuard struct {
-	path         string
-	maxDBBytes   int64
-	minFreeBytes int64
+	path           string
+	maxDBBytes     int64
+	minFreeBytes   int64
+	sizeBytes      func() (int64, error)
+	availableBytes func() (int64, error)
 }
 
-func (guard fileStorageGuard) Check(incomingBytes int64) error {
-	if incomingBytes < 0 {
+func (guard fileStorageGuard) Check(projectedGrowthBytes int64) error {
+	if projectedGrowthBytes < 0 {
 		return ErrStorageUnavailable
 	}
 	if guard.maxDBBytes > 0 {
-		info, err := os.Stat(guard.path)
+		sizeBytes := guard.sizeBytes
+		if sizeBytes == nil {
+			sizeBytes = func() (int64, error) {
+				info, err := os.Stat(guard.path)
+				if err != nil {
+					return 0, err
+				}
+				return info.Size(), nil
+			}
+		}
+		size, err := sizeBytes()
 		if err != nil {
 			return fmt.Errorf("%w: inspect inbox size", ErrStorageUnavailable)
 		}
-		if info.Size() > guard.maxDBBytes-incomingBytes {
+		if size > guard.maxDBBytes-projectedGrowthBytes {
 			return ErrStorageUnavailable
 		}
 	}
 	if guard.minFreeBytes > 0 {
-		var stat syscall.Statfs_t
-		if err := syscall.Statfs(guard.path, &stat); err != nil {
+		availableBytes := guard.availableBytes
+		if availableBytes == nil {
+			availableBytes = func() (int64, error) {
+				var stat syscall.Statfs_t
+				if err := syscall.Statfs(guard.path, &stat); err != nil {
+					return 0, err
+				}
+				return int64(stat.Bavail) * int64(stat.Bsize), nil
+			}
+		}
+		available, err := availableBytes()
+		if err != nil {
 			return fmt.Errorf("%w: inspect inbox filesystem", ErrStorageUnavailable)
 		}
-		available := int64(stat.Bavail) * int64(stat.Bsize)
-		if available < guard.minFreeBytes || incomingBytes > available-guard.minFreeBytes {
+		if available < guard.minFreeBytes || projectedGrowthBytes > available-guard.minFreeBytes {
 			return ErrStorageUnavailable
 		}
 	}

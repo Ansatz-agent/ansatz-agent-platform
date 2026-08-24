@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -112,6 +113,33 @@ func TestBoltStoreConcurrentAcceptCreatesOneCanonicalBatch(t *testing.T) {
 	}
 }
 
+func TestBoltStoreDuplicateAndConflictBypassNewAdmissionGuard(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	envelope := validEnvelope("account-a", "batch-a", []byte("protobuf"))
+	if _, err := store.Accept(context.Background(), envelope); err != nil {
+		t.Fatal(err)
+	}
+	rejecting := &rejectingStorageGuard{}
+	store.storageGuard = rejecting
+
+	duplicate, err := store.Accept(context.Background(), envelope)
+	if err != nil {
+		t.Fatalf("duplicate: %v", err)
+	}
+	if duplicate.Outcome != ReceiptDuplicate {
+		t.Fatalf("duplicate outcome = %q", duplicate.Outcome)
+	}
+	conflict := envelope
+	conflict.PayloadSHA256 = sha256Hex([]byte("different"))
+	_, err = store.Accept(context.Background(), conflict)
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("conflict error = %v", err)
+	}
+	if rejecting.calls != 0 {
+		t.Fatalf("guard calls = %d", rejecting.calls)
+	}
+}
+
 func TestBoltStoreReopenPreservesFIFOAndDelayedHeadBlocksLaterBatches(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inbox.db")
 	store := openTestStore(t, path)
@@ -120,7 +148,7 @@ func TestBoltStoreReopenPreservesFIFOAndDelayedHeadBlocksLaterBatches(t *testing
 			t.Fatal(err)
 		}
 	}
-	if err := store.MarkRetry(context.Background(), "one", Retry{
+	if err := store.MarkRetry(context.Background(), "account-a", "one", Retry{
 		NextRetry: testNow.Add(time.Minute),
 		LastError: "upstream_503",
 	}); err != nil {
@@ -145,7 +173,7 @@ func TestBoltStoreReopenPreservesFIFOAndDelayedHeadBlocksLaterBatches(t *testing
 	if head == nil || head.BatchID != "one" || head.Attempts != 1 || head.LastError != "upstream_503" {
 		t.Fatalf("head = %#v", head)
 	}
-	if err := store.MarkDelivered(context.Background(), "one", testNow.Add(time.Minute)); err != nil {
+	if err := store.MarkDelivered(context.Background(), "account-a", "one", testNow.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	next, err := store.PeekEligible(context.Background(), testNow.Add(time.Minute))
@@ -172,12 +200,49 @@ func TestBoltStoreReopenPreservesFIFOAndDelayedHeadBlocksLaterBatches(t *testing
 	}
 }
 
+func TestBoltStoreTransitionsAddressSameBatchIDInDifferentAccounts(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	for _, accountID := range []string{"account-a", "account-b"} {
+		if _, err := store.Accept(context.Background(), validEnvelope(accountID, "shared", []byte(accountID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkRetry(context.Background(), "account-a", "shared", Retry{
+		NextRetry: testNow.Add(time.Minute), LastError: "upstream_503",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	head, err := store.PeekEligible(context.Background(), testNow.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head == nil || head.AccountID != "account-a" || head.Attempts != 1 {
+		t.Fatalf("first account head = %#v", head)
+	}
+	if err := store.MarkDelivered(context.Background(), "account-a", "shared", testNow.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	next, err := store.PeekEligible(context.Background(), testNow.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == nil || next.AccountID != "account-b" || next.Attempts != 0 {
+		t.Fatalf("second account head = %#v", next)
+	}
+	if err := store.MarkQuarantined(context.Background(), "account-b", "shared", "upstream_400", testNow); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBucketEntries(t, store, quarantineBucket); got != 1 {
+		t.Fatalf("quarantine entries = %d", got)
+	}
+}
+
 func TestBoltStoreQuarantineRemovesFIFOButRetainsCanonicalRecord(t *testing.T) {
 	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
 	if _, err := store.Accept(context.Background(), validEnvelope("account-a", "bad", []byte("protobuf"))); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkQuarantined(context.Background(), "bad", "upstream_400", testNow); err != nil {
+	if err := store.MarkQuarantined(context.Background(), "account-a", "bad", "upstream_400", testNow); err != nil {
 		t.Fatal(err)
 	}
 	batch, err := store.PeekEligible(context.Background(), testNow)
@@ -192,6 +257,69 @@ func TestBoltStoreQuarantineRemovesFIFOButRetainsCanonicalRecord(t *testing.T) {
 	}
 	if got := countBucketEntries(t, store, quarantineBucket); got != 1 {
 		t.Fatalf("quarantine entries = %d", got)
+	}
+}
+
+func TestBoltStoreProjectsEncodedPageGrowthAgainstMaxDBBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbox.db")
+	store := openTestStore(t, path)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path, Options{
+		ReceiptRetention: 30 * 24 * time.Hour,
+		MaxDBBytes:       info.Size() + 1,
+		Now:              func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	_, err = store.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("x")))
+	if !errors.Is(err, ErrStorageUnavailable) {
+		t.Fatalf("error = %v", err)
+	}
+	if got := countCanonicalBatches(t, store); got != 0 {
+		t.Fatalf("committed batches = %d", got)
+	}
+}
+
+func TestBoltStoreProjectsEncodedPageGrowthAgainstMinFreeBytes(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	store.storageGuard = fileStorageGuard{
+		minFreeBytes:   999,
+		sizeBytes:      func() (int64, error) { return 0, nil },
+		availableBytes: func() (int64, error) { return 1000, nil },
+	}
+
+	_, err := store.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("x")))
+	if !errors.Is(err, ErrStorageUnavailable) {
+		t.Fatalf("error = %v", err)
+	}
+	if got := countCanonicalBatches(t, store); got != 0 {
+		t.Fatalf("committed batches = %d", got)
+	}
+}
+
+func TestBoltStoreZeroDeliveryTimeUsesStoreClockForReceiptCollection(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	if _, err := store.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("x"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDelivered(context.Background(), "account-a", "batch-a", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	collected, err := store.CollectReceipts(context.Background(), testNow.Add(30*24*time.Hour+time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 1 {
+		t.Fatalf("collected receipts = %d", collected)
 	}
 }
 
@@ -286,4 +414,13 @@ func countBucketEntries(t *testing.T, store *BoltStore, bucket []byte) int {
 		t.Fatal(err)
 	}
 	return count
+}
+
+type rejectingStorageGuard struct {
+	calls int
+}
+
+func (guard *rejectingStorageGuard) Check(int64) error {
+	guard.calls++
+	return ErrStorageUnavailable
 }

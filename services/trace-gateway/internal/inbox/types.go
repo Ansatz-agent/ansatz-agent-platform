@@ -59,7 +59,7 @@ type Retry struct {
 }
 
 type StorageGuard interface {
-	Check(incomingBytes int64) error
+	Check(projectedGrowthBytes int64) error
 }
 
 type Options struct {
@@ -74,9 +74,9 @@ type Options struct {
 type Store interface {
 	Accept(context.Context, Envelope) (AcceptResult, error)
 	PeekEligible(context.Context, time.Time) (*Batch, error)
-	MarkRetry(context.Context, string, Retry) error
-	MarkDelivered(context.Context, string, time.Time) error
-	MarkQuarantined(context.Context, string, string, time.Time) error
+	MarkRetry(context.Context, string, string, Retry) error
+	MarkDelivered(context.Context, string, string, time.Time) error
+	MarkQuarantined(context.Context, string, string, string, time.Time) error
 	CollectReceipts(context.Context, time.Time) (int, error)
 	Sync() error
 	Close() error
