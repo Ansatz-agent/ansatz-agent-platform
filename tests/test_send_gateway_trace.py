@@ -58,25 +58,25 @@ class SendGatewayTraceTest(unittest.TestCase):
         payloads: list[bytes] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.method == "GET" and request.url.path == "/agent/accounts/login/":
+            if request.method == "GET" and request.url.path == "/auth/login/":
                 return httpx.Response(
                     200,
                     headers={
-                        "set-cookie": "agent_history_csrftoken=csrf-value; Path=/agent/"
+                        "set-cookie": "__Host-ansatz_csrftoken=csrf-value; Secure; Path=/"
                     },
                 )
-            if request.method == "POST" and request.url.path == "/agent/accounts/login/":
+            if request.method == "POST" and request.url.path == "/auth/login/":
                 self.assertEqual(request.headers["x-csrftoken"], "csrf-value")
                 self.assertIn(password.encode(), request.content)
                 return httpx.Response(
                     302,
                     headers=[
-                        ("location", "/agent/dashboard/"),
-                        ("set-cookie", "agent_history_sessionid=session-value; Path=/agent/"),
-                        ("set-cookie", "agent_history_csrftoken=rotated-csrf; Path=/agent/"),
+                        ("location", "/traces/"),
+                        ("set-cookie", "__Host-ansatz_sessionid=session-value; Secure; Path=/"),
+                        ("set-cookie", "__Host-ansatz_csrftoken=rotated-csrf; Secure; Path=/"),
                     ],
                 )
-            if request.method == "POST" and request.url.path == "/agent/api/trace-token/":
+            if request.method == "POST" and request.url.path == "/auth/api/trace-token/":
                 self.assertEqual(request.headers["x-csrftoken"], "rotated-csrf")
                 request_body = json.loads(request.content)
                 self.assertEqual(
@@ -105,7 +105,7 @@ class SendGatewayTraceTest(unittest.TestCase):
             raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
         credentials = {
-            "AUTH_BASE_URL": "https://c2sml.cn/agent",
+            "AUTH_BASE_URL": "https://c2sml.cn/auth",
             "USER_A_ID": "42",
             "USER_A_USERNAME": "trace-user-a",
             "USER_A_PASSWORD": password,

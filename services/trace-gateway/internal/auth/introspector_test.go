@@ -34,7 +34,7 @@ func TestIntrospectorReturnsExactActivePrincipal(t *testing.T) {
 			t.Fatalf("unexpected request: %#v", request)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"active":true,"token_id":"token-id","platform_user_id":"42","installation_id":"11111111-1111-4111-8111-111111111111","expires_at":"2030-01-02T03:04:05Z","scope":"trace:write","audience":"ansatz-trace-gateway"}`)
+		io.WriteString(w, `{"active":true,"token_id":"token-id","platform_user_id":"42","platform_username":"yiyuxiao","installation_id":"11111111-1111-4111-8111-111111111111","expires_at":"2030-01-02T03:04:05Z","scope":"trace:write","audience":"ansatz-trace-gateway"}`)
 	}))
 	defer server.Close()
 
@@ -43,11 +43,25 @@ func TestIntrospectorReturnsExactActivePrincipal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if principal.TokenID != "token-id" || principal.UserID != "42" || principal.Scope != "trace:write" {
+	if principal.TokenID != "token-id" || principal.UserID != "42" || principal.Username != "yiyuxiao" || principal.Scope != "trace:write" {
 		t.Fatalf("unexpected principal: %#v", principal)
 	}
 	if principal.ExpiresAt.Format(time.RFC3339) != "2030-01-02T03:04:05Z" {
 		t.Fatalf("unexpected expiry: %s", principal.ExpiresAt)
+	}
+}
+
+func TestIntrospectorRejectsActiveResponseWithoutUsername(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"active":true,"token_id":"token-id","platform_user_id":"42","installation_id":"11111111-1111-4111-8111-111111111111","expires_at":"2030-01-02T03:04:05Z","scope":"trace:write","audience":"ansatz-trace-gateway"}`)
+	}))
+	defer server.Close()
+
+	_, err := NewIntrospector(server.URL, testSecret, time.Second).Introspect(
+		context.Background(), testBearer,
+	)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("error = %v", err)
 	}
 }
 

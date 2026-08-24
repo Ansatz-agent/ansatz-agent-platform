@@ -19,6 +19,7 @@ var (
 type Principal struct {
 	TokenID        string
 	UserID         string
+	Username       string
 	InstallationID string
 	ExpiresAt      time.Time
 	Scope          string
@@ -32,13 +33,14 @@ type Introspector struct {
 }
 
 type introspectionResponse struct {
-	Active         bool   `json:"active"`
-	TokenID        string `json:"token_id"`
-	PlatformUserID string `json:"platform_user_id"`
-	InstallationID string `json:"installation_id"`
-	ExpiresAt      string `json:"expires_at"`
-	Scope          string `json:"scope"`
-	Audience       string `json:"audience"`
+	Active           bool   `json:"active"`
+	TokenID          string `json:"token_id"`
+	PlatformUserID   string `json:"platform_user_id"`
+	PlatformUsername string `json:"platform_username"`
+	InstallationID   string `json:"installation_id"`
+	ExpiresAt        string `json:"expires_at"`
+	Scope            string `json:"scope"`
+	Audience         string `json:"audience"`
 }
 
 func NewIntrospector(endpoint, internalSecret string, timeout time.Duration) *Introspector {
@@ -91,7 +93,7 @@ func (i *Introspector) Introspect(ctx context.Context, bearer string) (Principal
 		return Principal{}, ErrInactive
 	}
 	expiresAt, err := time.Parse(time.RFC3339, body.ExpiresAt)
-	if err != nil || body.TokenID == "" || body.PlatformUserID == "" || body.InstallationID == "" {
+	if err != nil || body.TokenID == "" || body.PlatformUserID == "" || body.PlatformUsername == "" || body.InstallationID == "" {
 		return Principal{}, ErrUnavailable
 	}
 	if body.Scope != "trace:write" || body.Audience != "ansatz-trace-gateway" || !expiresAt.After(time.Now()) {
@@ -100,6 +102,7 @@ func (i *Introspector) Introspect(ctx context.Context, bearer string) (Principal
 	return Principal{
 		TokenID:        body.TokenID,
 		UserID:         body.PlatformUserID,
+		Username:       body.PlatformUsername,
 		InstallationID: body.InstallationID,
 		ExpiresAt:      expiresAt,
 		Scope:          body.Scope,

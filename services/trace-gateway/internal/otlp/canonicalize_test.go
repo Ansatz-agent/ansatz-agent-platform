@@ -20,6 +20,7 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 			kv("session.id", "forged-session"),
 			kv("langfuse.session.id", "forged-langfuse-session"),
 			kv("gen_ai.conversation.id", "forged-conversation"),
+			kv("langfuse.trace.metadata.username", "forged-username"),
 			kv("prompt", "full prompt"),
 		}},
 		ScopeSpans: []*tracepb.ScopeSpans{{
@@ -42,6 +43,7 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	principal := auth.Principal{
 		TokenID:        "trusted-token",
 		UserID:         "42",
+		Username:       "yiyuxiao",
 		InstallationID: "11111111-1111-4111-8111-111111111111",
 		Scope:          "trace:write",
 		Audience:       "ansatz-trace-gateway",
@@ -56,6 +58,7 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	assertSingle(t, resource, "platform.user.id", "42")
 	assertSingle(t, resource, "user.id", "42")
 	assertSingle(t, resource, "langfuse.user.id", "42")
+	assertSingle(t, resource, "langfuse.trace.metadata.username", "yiyuxiao")
 	assertSingle(t, resource, "client.installation.id", principal.InstallationID)
 	assertSingle(t, resource, "hermes.session.id", "session-1")
 	assertSingle(t, resource, "session.id", "session-1")
@@ -69,6 +72,7 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	span := request.ResourceSpans[0].ScopeSpans[0].Spans[0]
 	assertSingle(t, span.Attributes, "user.id", "42")
 	assertSingle(t, span.Attributes, "langfuse.user.id", "42")
+	assertSingle(t, span.Attributes, "langfuse.trace.metadata.username", "yiyuxiao")
 	assertSingle(t, span.Attributes, "session.id", "session-1")
 	assertSingle(t, span.Attributes, "langfuse.session.id", "session-1")
 	assertSingle(t, span.Attributes, "gen_ai.conversation.id", "session-1")
@@ -80,6 +84,7 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 		"forged-session",
 		"forged-langfuse-session",
 		"forged-conversation",
+		"forged-username",
 		"forged-scope",
 		"forged-span",
 		"forged-event",
@@ -94,6 +99,43 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 			t.Fatalf("semantic value %q missing: %s", semantic, all)
 		}
 	}
+}
+
+func TestCanonicalizeProjectsRelayUsageIntoLangfuseGeneration(t *testing.T) {
+	request := &collectortracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{{
+			Name: "openai",
+			Attributes: []*commonpb.KeyValue{
+				kv("nemo_relay.scope_type", "llm"),
+				kv("langfuse.observation.usage_details", `{"input":999999}`),
+				kv("nemo_relay.end.output.usage", `{
+					"prompt_tokens": 27376,
+					"completion_tokens": 2370,
+					"total_tokens": 29746,
+					"prompt_tokens_details": {"cached_tokens": 11432},
+					"completion_tokens_details": {"reasoning_tokens": 302}
+				}`),
+			},
+		}}}},
+	}}}
+	principal := auth.Principal{UserID: "42", Username: "yiyuxiao", InstallationID: "11111111-1111-4111-8111-111111111111"}
+	headers := Headers{SessionID: "session-1", Entrypoint: "desktop", RunID: "run-1", SchemaVersion: "1"}
+
+	if err := Canonicalize(request, principal, headers, "gateway-request-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	assertJSONEquivalent(
+		t,
+		attributeString(request.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes, "langfuse.observation.usage_details"),
+		`{
+			"input": 15944,
+			"output": 2068,
+			"total": 29746,
+			"input_cached_tokens": 11432,
+			"output_reasoning_tokens": 302
+		}`,
+	)
 }
 
 func TestCanonicalizeProjectsCompleteRelayConversationIntoLangfuse(t *testing.T) {
@@ -114,7 +156,7 @@ func TestCanonicalizeProjectsCompleteRelayConversationIntoLangfuse(t *testing.T)
 					kv("nemo_relay.scope_type", "llm"),
 					kv("nemo_relay.start.input.content", `{"messages":[{"role":"user","content":"完整用户问题"}]}`),
 					kv("nemo_relay.end.output.choices", `[{"message":{"role":"assistant","content":"完整助手回复"}}]`),
-					kv("nemo_relay.model_name", "openai/gpt-5.5"),
+					kv("nemo_relay.model_name", "openai/openai/gpt-5.5"),
 				},
 			},
 			{
@@ -129,7 +171,7 @@ func TestCanonicalizeProjectsCompleteRelayConversationIntoLangfuse(t *testing.T)
 			},
 		}}},
 	}}}
-	principal := auth.Principal{UserID: "42", InstallationID: "11111111-1111-4111-8111-111111111111"}
+	principal := auth.Principal{UserID: "42", Username: "yiyuxiao", InstallationID: "11111111-1111-4111-8111-111111111111"}
 	headers := Headers{SessionID: "session-1", Entrypoint: "desktop", RunID: "run-1", SchemaVersion: "1"}
 
 	if err := Canonicalize(request, principal, headers, "gateway-request-1"); err != nil {
