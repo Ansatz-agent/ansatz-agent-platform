@@ -37,10 +37,10 @@ The selected design is:
 
 ### 2.2 Trace continuity
 
-- A local OTLP batch is acknowledged to Relay only after a durable encrypted outbox record is committed to disk.
+- A local OTLP batch is acknowledged to Relay only after one durable owner exists: either the Gateway has returned a matching durable receipt or an encrypted outbox record has completed segment+journal fsync.
 - Pending batches survive normal quit, crash, process termination, operating-system restart, authentication outage, Trace-token failure, Gateway failure, and Langfuse failure.
 - Upload is FIFO per account. A failed head batch remains durable and is retried without repeating Agent/model/tool work.
-- A successful or duplicate durable Gateway receipt is required before deleting the corresponding local payload.
+- A successful or duplicate durable Gateway receipt means payload bytes are not retained locally: a not-yet-committed append is cancelled, or an already committed outbox record is tombstoned and reclaimed.
 - Recovery is triggered by a new batch, retry timer, renderer online transition, system resume, window focus, Trace-token refresh completion, token-near-expiry timer, and upload 401.
 - Trace credential acquisition is single-flight. Upload 401 refreshes only the Trace credential and resends the same batch.
 - Short-lived token rotation, Gateway restart, concurrent retries, and lost upstream responses do not create a second logical Gateway batch.
@@ -386,7 +386,9 @@ Each durable envelope includes:
 
 ```text
 received
-  -> durable_pending
+  -> racing_gateway_and_local_commit
+  -> gateway_owned (matching durable receipt wins)
+  -> durable_pending (local fsync wins or cloud is unavailable)
   -> sending
   -> durable_pending (retryable failure)
   -> quarantined (terminal payload error)
@@ -394,7 +396,9 @@ received
   -> deleted payload + retained receipt tombstone
 ```
 
-The loopback endpoint returns success only after `durable_pending` is committed in a synced segment and journal. A failed disk write returns a local 507-style failure to Relay and records a non-sensitive diagnostic; it never claims persistence.
+The normal online path races two durable boundaries using the same preassigned `batch_id` and payload digest: Gateway acceptance and the local compressed/encrypted append. The loopback endpoint returns success when the first boundary completes. If the Gateway receipt wins before the journal commit, the append is cancelled; any unjournaled tail is ignored/truncated during recovery and only a small payload-free receipt tombstone may remain for deduplication. If local fsync wins, the record becomes `durable_pending`, Relay receives success, and the in-flight upload continues; a later matching receipt tombstones the record and makes its segment bytes reclaimable. Successful Trace/span payload bytes are therefore never retained locally beyond this transient race/reclamation window.
+
+The direct Gateway race is allowed only when the account has no older pending/quarantined sendable batch and the caller owns the per-account admission/send slot. If backlog exists or another batch owns the slot, the new batch commits locally and joins FIFO; newer data cannot bypass older durable data. Authentication/token unavailability skips the cloud contender and proceeds directly to local durability. If both durable paths fail, return a local 507-style failure and a non-sensitive diagnostic; never claim persistence.
 
 FIFO is per account. Retryable failure retains the head. Terminal `400/409-digest-mismatch/413/415` moves the payload to encrypted quarantine rather than silently deleting it. Quarantine counts toward the same capacity and retention limits.
 
@@ -428,7 +432,7 @@ Only one pump per account and one Trace credential request may run at a time. A 
 
 The outbox maintains 30-day receipt tombstones keyed by account, correlation fields, and payload digest. Repeated local submission of identical bytes while pending or recently accepted returns the existing local receipt instead of creating another batch. Tombstones are size-bounded independently from payload storage.
 
-Accepted payloads are marked reclaimable in the journal. A segment is physically removed only after every record in it is accepted, expired, evicted, or moved into a compacted quarantine segment. This avoids rewriting or deleting large blobs on every acknowledgement.
+Accepted payloads are marked reclaimable in the journal. A segment is physically removed only after every record in it is accepted, expired, evicted, or moved into a compacted quarantine segment. Gateway-first cancellation leaves no committed payload record; if append bytes reached an unjournaled tail, startup recovery truncates them. This avoids retaining successful payloads while also avoiding rewriting or deleting large blobs synchronously on every acknowledgement.
 
 ## 11. Durable Gateway inbox and idempotency
 
@@ -566,7 +570,9 @@ All behavior changes follow one-test RED, observed expected failure, minimal GRE
 
 ### 16.2 Client outbox
 
-- local loopback success happens only after fsync-backed durable write;
+- local loopback success happens only after either a matching Gateway durable receipt or an fsync-backed local write;
+- with no older backlog, Gateway acceptance and local commit race on the same batch ID; the winner is crash-safe and successful payload bytes are not retained locally;
+- with older backlog, new batches persist locally and cannot bypass FIFO;
 - crash during temp write, rename, manifest update, send, and ack recovers deterministically;
 - quit/restart/device restart replays FIFO;
 - account namespaces cannot decrypt or send one another's batches;
@@ -603,7 +609,7 @@ All behavior changes follow one-test RED, observed expected failure, minimal GRE
 
 - one login produces account/session identity, starts local Hermes, stores a Trace, obtains a token asynchronously, receives a durable Gateway receipt, and eventually appears in Langfuse;
 - auth service and Gateway are stopped while the client restarts and continues a local conversation;
-- Trace remains on disk through restart and uploads automatically after recovery;
+- a Trace whose Gateway race does not win remains on disk through restart and uploads automatically after recovery; Gateway-accepted payloads are absent or promptly reclaimed locally;
 - ingest 401 rotates only Trace token;
 - explicit Session revoke stops local capability without deleting conversation data;
 - retry produces no duplicate logical Gateway batch or model/tool execution.
@@ -618,7 +624,7 @@ Completion requires fresh evidence for every item:
 4. Only sign-out or structured account/current-Session revocation stops local capability.
 5. Sign-out and revocation preserve SessionDB, attachments, and local conversations.
 6. Trace-token acquisition is asynchronous and never blocks backend start.
-7. Every locally acknowledged Trace batch is durably encrypted on disk first.
+7. Every locally acknowledged Trace batch has one proven durable owner first: matching Gateway receipt or encrypted local fsync; Gateway-accepted payload bytes are not retained locally.
 8. Pending batches survive quit/crash/restart and automatically resume from every required trigger.
 9. FIFO, single-flight, 401 refresh, retry, limits, retention, quarantine, and controlled degradation match this spec.
 10. Server exposes immutable account UUID and durable, structured native Session revocation.
@@ -650,4 +656,5 @@ No implementation decision remains open at the design gate:
 - outbox uses Brotli-compressed, per-account AES-256-GCM append-only segments with an OS-wrapped key and a reconstructable checksummed journal;
 - Gateway uses durable inbox acceptance and token-independent `batch_id` receipts;
 - accepted Gateway ownership is the client deletion boundary;
+- online admission races Gateway durable ownership against local fsync only when no older FIFO backlog exists; successful payload bytes are cancelled or reclaimed locally;
 - the three repositories and two parallel streams are fixed above.

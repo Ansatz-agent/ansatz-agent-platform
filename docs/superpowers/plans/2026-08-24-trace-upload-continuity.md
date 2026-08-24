@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Preserve every locally acknowledged Desktop Trace batch in an encrypted crash-safe outbox, resume FIFO upload without blocking local Hermes, and transfer durable ownership to an idempotent Gateway inbox before deleting the client payload.
+**Goal:** Give every locally acknowledged Desktop Trace batch one crash-safe owner by racing Gateway durable acceptance against an encrypted local commit, retain only batches the Gateway has not durably accepted, and resume FIFO upload without blocking local Hermes.
 
-**Architecture:** Python removes only redundant turn-mark history and inline binary payloads before export, while retaining each model span's complete provider request. Electron main accepts loopback OTLP into a per-account Brotli/AES-GCM segment store with a checksummed journal, then a single-flight credential provider and one pump per account send stable batches to a bbolt-backed Gateway inbox. The Gateway acknowledges after a synced transaction and delivers accepted canonical OTLP to Langfuse asynchronously with persistent receipts and FIFO retry state.
+**Architecture:** Python removes only redundant turn-mark history and inline binary payloads before export, while retaining each model span's complete provider request. With no older backlog, Electron races the same stable batch ID to a bbolt-backed Gateway inbox and a per-account Brotli/AES-GCM segment store; Relay is acknowledged when either a matching Gateway receipt or local segment+journal fsync wins. Gateway-first payloads are cancelled/reclaimed locally, while local-first/offline payloads remain in FIFO. The Gateway acknowledges after a synced transaction and delivers accepted canonical OTLP to Langfuse asynchronously with persistent receipts and FIFO retry state.
 
 **Tech Stack:** Python 3.11+, pytest, Electron 40 / Node 22, TypeScript 6, Vitest 4, Node `crypto`/`zlib`/`fs`, Go 1.24, bbolt, OTLP protobuf, Docker Compose, Python unittest/httpx.
 
@@ -21,8 +21,9 @@
 - Client hard limits are exactly 2 GiB and 30 days per account, 64 MiB target segments, an 8 MiB logical batch limit before compression, a 50 ms maximum group-commit window, and a free-volume reserve of `max(1 GiB, 5%)`.
 - Retry is full-jitter exponential with base 1 second, multiplier 2, cap 5 minutes; a longer valid `Retry-After` wins.
 - Compression occurs before AES-256-GCM encryption. No plaintext Trace payload or raw data key is persisted.
-- Local Relay success is sent only after both the segment and journal durability barriers complete.
-- Client payload deletion occurs only after an `accepted` or `duplicate` durable Gateway receipt is journaled and synced.
+- Local Relay success is sent only after either a matching durable Gateway receipt or both local segment and journal durability barriers complete.
+- The direct Gateway race runs only with no older per-account backlog and one admission/send owner; otherwise the batch commits locally and joins FIFO.
+- An `accepted` or `duplicate` Gateway receipt cancels an uncommitted append or tombstones/reclaims an already committed payload. Successful Trace/span payload bytes are not retained locally.
 - Gateway acceptance keys are trusted `account_id + batch_id`; Trace token ID is never part of idempotency identity.
 - Gateway accepted-but-undelivered payloads are never evicted automatically. A storage safety failure rejects new acceptance with HTTP 507.
 - Use the Conda environment `dl` for Python verification and never create a project-local virtual environment.
@@ -498,7 +499,7 @@ rtk git add apps/desktop/electron/trace-outbox-crypto.ts apps/desktop/electron/t
 rtk git commit -m "feat(trace): encrypt compressed outbox records"
 ```
 
-### Task 6: Add the Checksummed Journal and Fsync-Before-Ack Group Commit
+### Task 6: Add the Checksummed Journal and Cancellable Local Commit
 
 **Files:**
 - Create: `apps/desktop/electron/trace-outbox-journal.ts`
@@ -508,7 +509,7 @@ rtk git commit -m "feat(trace): encrypt compressed outbox records"
 
 **Interfaces:**
 - Produces: `TraceJournal.append(operations)` and `recover()`.
-- Produces: `TraceOutboxStore.open(options)` and `enqueue(input)`.
+- Produces: `TraceOutboxStore.open(options)`, `enqueue(input)`, and `beginEnqueue(input): PendingLocalCommit` where `durable` resolves after both sync barriers and `cancelForGatewayReceipt(receipt)` prevents or tombstones local payload retention.
 - Durability order is observable through injected `TraceFileSystem`; enqueue resolves only after segment sync and journal sync.
 
 - [ ] **Step 1: Write the failing durability-order test**
@@ -532,6 +533,14 @@ test('resolves every grouped enqueue only after segment sync then journal sync',
   gate.resolve()
   await Promise.all([first, second])
   assert.deepEqual(events, ['segment.write', 'segment.write', 'segment.sync', 'journal.write', 'journal.sync'])
+})
+
+test('Gateway receipt can win before local commit without retaining payload bytes', async () => {
+  const store = await TraceOutboxStore.open(options({ fs: gatedTraceFileSystem() }))
+  const pending = store.beginEnqueue(envelope('online'))
+  await pending.cancelForGatewayReceipt(receipt('online', 'accepted'))
+  assert.equal((await store.diagnostics()).payloadBytes, 0)
+  assert.equal((await store.lookupReceipt(pending.batchId))?.outcome, 'accepted')
 })
 ```
 
@@ -569,13 +578,13 @@ Schedule the first queued write for at most 50 ms; reaching 8 MiB of uncommitted
 rtk npm --prefix apps/desktop run test:desktop:platforms -- electron/trace-outbox-journal.test.ts electron/trace-outbox-store.test.ts
 ```
 
-Expected: PASS; no promise resolves before both sync barriers, and a failed segment or journal sync rejects every member of that group.
+Expected: PASS; no local-durability promise resolves before both sync barriers, a failed segment or journal sync rejects every member of that group, and a Gateway-first cancellation retains no committed payload bytes. Cancellation before segment append removes the queued item; cancellation after append records a payload-free receipt/tombstone and makes the record reclaimable. A crash before cancellation metadata is synced may reconstruct a pending record, which safely reuploads the same batch ID and is removed after the Gateway returns `duplicate`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 rtk git add apps/desktop/electron/trace-outbox-journal.ts apps/desktop/electron/trace-outbox-journal.test.ts apps/desktop/electron/trace-outbox-store.ts apps/desktop/electron/trace-outbox-store.test.ts
-rtk git commit -m "feat(trace): persist outbox before local acknowledgement"
+rtk git commit -m "feat(trace): add cancellable durable local commits"
 ```
 
 ### Task 7: Recover Torn Writes and Preserve FIFO Across Restart
@@ -802,7 +811,7 @@ rtk git add apps/desktop/electron/trace-retry-policy.ts apps/desktop/electron/tr
 rtk git commit -m "fix(trace): serialize token refresh and retry scheduling"
 ```
 
-### Task 10: Make the Loopback Forwarder Acknowledge Only Durable Batches
+### Task 10: Race Gateway Durability Against the Local Outbox
 
 **Files:**
 - Modify: `apps/desktop/electron/trace-forwarder.ts`
@@ -816,24 +825,35 @@ rtk git commit -m "fix(trace): serialize token refresh and retry scheduling"
 - `start(owner)` opens loopback admission without acquiring a Trace token.
 - Upstream headers add `Idempotency-Key` and `X-Trace-Payload-SHA256`.
 - HTTP 200/2xx is accepted only with matching `X-Trace-Batch-ID` and `X-Trace-Receipt: accepted|duplicate`.
+- A per-account admission/send mutex permits the direct Gateway contender only when `store.hasBacklog()` is false; all later/concurrent batches commit locally so FIFO cannot be bypassed.
 
 - [ ] **Step 1: Write failing durable-boundary and receipt tests**
 
 ```ts
-test('local 200 waits for outbox durability and Gateway receipt controls deletion', async () => {
-  const durable = deferred<DurableTraceBatch>()
-  const store = fakeOutbox({ enqueue: () => durable.promise })
+test('matching Gateway receipt can win before fsync and leaves no local payload', async () => {
+  const local = deferred<DurableTraceBatch>()
+  const pending = fakePendingCommit({ durable: local.promise })
+  const store = fakeOutbox({ beginEnqueue: () => pending, hasBacklog: () => false })
   const forwarder = new TraceForwarder({ store, credentialProvider, installationId })
   const started = await forwarder.start(validOwner())
   const posted = post(started.endpoint, started.localBearer)
-  assert.equal(await settlesWithin(posted, 25), false)
-  durable.resolve(batch('batch-1'))
-  assert.equal((await posted).status, 200)
   await waitFor(() => upstreamCalls.length === 1)
-  assert.equal(upstreamCalls[0].headers.get('idempotency-key'), 'batch-1')
-  assert.equal(store.acknowledge.mock.calls.length, 0)
-  gatewayResponse.resolve(receiptResponse('batch-1', 'accepted'))
-  await waitFor(() => store.acknowledge.mock.calls.length === 1)
+  gatewayResponse.resolve(receiptResponse(pending.batchId, 'accepted'))
+  assert.equal((await posted).status, 200)
+  assert.equal(pending.cancelForGatewayReceipt.mock.calls.length, 1)
+  assert.equal(store.diagnostics().payloadBytes, 0)
+  assert.equal(local.settled, false)
+})
+
+test('offline batch waits for fsync and existing backlog disables direct upload', async () => {
+  const local = deferred<DurableTraceBatch>()
+  const store = fakeOutbox({ beginEnqueue: () => fakePendingCommit({ durable: local.promise }), hasBacklog: () => true })
+  const started = await new TraceForwarder({ store, credentialProvider, installationId }).start(validOwner())
+  const posted = post(started.endpoint, started.localBearer)
+  assert.equal(await settlesWithin(posted, 25), false)
+  assert.equal(upstreamCalls.length, 0)
+  local.resolve(batch('batch-1'))
+  assert.equal((await posted).status, 200)
 })
 ```
 
@@ -843,21 +863,22 @@ test('local 200 waits for outbox durability and Gateway receipt controls deletio
 rtk npm --prefix apps/desktop run test:desktop:platforms -- electron/trace-forwarder.test.ts
 ```
 
-Expected: FAIL because current `handle()` returns 200 immediately after an in-memory enqueue and accepts any 2xx as deletion authority.
+Expected: FAIL because current `handle()` returns 200 after an in-memory enqueue and has neither a cancellable local commit nor the no-backlog durability race.
 
 - [ ] **Step 3: Replace the memory queue path**
 
 ```ts
-const split = splitOtlpExportTraceRequest(body, MAX_LOGICAL_BATCH_BYTES)
-for (const oversizedSpan of split.oversizedSpans) {
-  await this.store.quarantineInput({ ...metadata, body: oversizedSpan }, 'payload_too_large')
+const pending = this.store.beginEnqueue({ ...metadata, batchId, body })
+const cloud = this.mayRaceGatewayDirectly()
+  ? this.sendAndRequireMatchingReceipt({ batchId, body, payloadSha256 })
+  : neverSettles<DurableReceipt>()
+const winner = await firstDurableOwner({ local: pending.durable, cloud })
+if (winner.kind === 'gateway') void pending.cancelForGatewayReceipt(winner.receipt)
+else {
+  this.recovery.trigger('durable-enqueue')
+  void cloud.then(receipt => this.store.acknowledge(batchId, receipt)).catch(() => undefined)
 }
-const durable: DurableTraceBatch[] = []
-for (const batchBody of split.batches) {
-  durable.push(await this.store.enqueue({ ...metadata, body: batchBody }))
-}
-respond(response, split.oversizedSpans.length ? 422 : 200, true)
-this.recovery.trigger('durable-enqueue')
+respond(response, 200, true)
 
 const receipt = parseGatewayReceipt(response, batch.batchId)
 if (receipt) {
@@ -866,7 +887,7 @@ if (receipt) {
 }
 ```
 
-Loopback body read is capped at 64 MiB; `splitOtlpExportTraceRequest(..., 8 * 1024 * 1024)` runs before enqueue and every normal split batch is enqueued in source order. Every oversize span is durably written through `quarantineInput()` before Relay receives a non-success diagnostic response; an oversize span never prevents later spans/resources from being admitted. Disk/key/reserve failures return HTTP 507 without claiming persistence. Gateway 400, 409, 413, and 415 quarantine; 401 refreshes only Trace credential and resends the same batch; 403 is forwarded as explicit revocation evidence; 429/5xx/network retain the head.
+Apply the race independently and sequentially to every normal split batch so all pieces have a durable owner before the loopback request succeeds. Loopback body read is capped at 64 MiB; `splitOtlpExportTraceRequest(..., 8 * 1024 * 1024)` runs before admission and preserves source order. Every oversize span is durably written through `quarantineInput()` before Relay receives a non-success diagnostic response; an oversize span never prevents later spans/resources from being admitted. Authentication/token unavailability disables only the cloud contender. If local and cloud both fail, return HTTP 507 without claiming persistence. Gateway 400, 409, 413, and 415 quarantine; 401 refreshes only Trace credential and resends the same batch; 403 is forwarded as explicit revocation evidence; 429/5xx/network leave or create the local head. A matching Gateway receipt always cancels/tombstones local bytes; successful Trace/span payloads are not retained.
 
 - [ ] **Step 4: Run forwarder/outbox tests GREEN, then remove old queue files**
 
@@ -875,7 +896,7 @@ rtk npm --prefix apps/desktop run test:desktop:platforms -- electron/trace-forwa
 rtk npm --prefix apps/desktop run typecheck
 ```
 
-Expected: PASS; no import references `TraceForwarderQueue`, local success follows durable commit, and failures retain or quarantine exactly once.
+Expected: PASS; no import references `TraceForwarderQueue`; Gateway-first success can precede fsync and leaves no retained payload; local-first/offline success waits for fsync; backlog prevents bypass; both-path failure never returns success; failures retain or quarantine exactly once.
 
 - [ ] **Step 5: Commit**
 
@@ -1000,6 +1021,17 @@ test('offline accepted Trace survives quit and uploads FIFO after same-account r
   assert.deepEqual(gateway.payloadOrder, [sha(payload(1)), sha(payload(2))])
   assert.deepEqual(gateway.receipts, ['accepted', 'accepted'])
 })
+
+test('online durable Gateway receipt avoids retaining successful payload locally', async () => {
+  const userData = await temporaryOutboxDirectory()
+  const gateway = await controllableGateway({ online: true, durableReceipts: true })
+  const client = await launchTraceHarness({ userData, owner: ownerA, gateway, holdLocalFsync: true })
+  assert.equal((await client.post(payload(3))).status, 200)
+  await client.waitForLocalCleanup()
+  assert.equal(client.outboxDiagnostics().payloadBytes, 0)
+  assert.deepEqual(gateway.receipts, ['accepted'])
+  assert.equal(gateway.logicalBatchCount, 1)
+})
 ```
 
 - [ ] **Step 2: Run and verify RED**
@@ -1008,7 +1040,7 @@ test('offline accepted Trace survives quit and uploads FIFO after same-account r
 rtk npm --prefix apps/desktop run test:desktop:platforms -- electron/trace-continuity.integration.test.ts
 ```
 
-Expected: FAIL until restart ownership, close semantics, and account-key directory routing are fully connected.
+Expected: FAIL until restart ownership, close semantics, account-key directory routing, and the Gateway-first no-retained-payload path are fully connected.
 
 - [ ] **Step 3: Apply only the minimal integration fixes revealed by the test**
 
