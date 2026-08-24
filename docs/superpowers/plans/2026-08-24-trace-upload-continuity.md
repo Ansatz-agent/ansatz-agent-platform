@@ -274,7 +274,7 @@ rtk git commit -m "feat(trace): summarize inline media before export"
 - Modify: `apps/desktop/electron/otlp-correlation.ts`
 
 **Interfaces:**
-- Produces: `splitOtlpExportTraceRequest(body: Buffer, maxBytes: number): { batches: Buffer[]; oversizedSpan: Buffer | null }`.
+- Produces: `splitOtlpExportTraceRequest(body: Buffer, maxBytes: number): { batches: Buffer[]; oversizedSpans: Buffer[] }`.
 - Produces internal reusable protobuf helpers `readFields()`, `encodeLengthDelimited()`, and `encodeMessage()` from the existing correlation parser.
 - Guarantees each returned batch is a valid `ExportTraceServiceRequest`, preserves resource and instrumentation-scope messages, and keeps span order.
 
@@ -295,7 +295,7 @@ test('splits by span while preserving resource and scope and quarantines one ove
     150
   )
   assert.equal(oversize.batches.length, 0)
-  assert.equal(readSpanIds(oversize.oversizedSpan!), 3)
+  assert.deepEqual(oversize.oversizedSpans.flatMap(readSpanIds), [3])
 })
 ```
 
@@ -312,26 +312,30 @@ Expected: FAIL because `otlp-split.ts` and `splitOtlpExportTraceRequest` do not 
 ```ts
 export function splitOtlpExportTraceRequest(body: Buffer, maxBytes: number): SplitOtlpResult {
   const decoded = decodeExportRequest(body)
-  if (!decoded || maxBytes <= 0) return { batches: [], oversizedSpan: body }
+  if (!decoded || maxBytes <= 0) return { batches: [], oversizedSpans: [body] }
   const batches: Buffer[] = []
+  const oversizedSpans: Buffer[] = []
   for (const resource of decoded.resources) {
     let current: Buffer[] = []
     for (const scopedSpan of resource.scopedSpans) {
-      const candidate = encodeExport(resource, [...current, scopedSpan])
-      if (candidate.length <= maxBytes) { current.push(scopedSpan); continue }
+      for (const span of scopedSpan.spans) {
+      const envelopedSpan = scopedSpan.withSpans([span])
+      const candidate = encodeExport(resource, [...current, envelopedSpan])
+      if (candidate.length <= maxBytes) { current.push(envelopedSpan); continue }
       if (current.length) batches.push(encodeExport(resource, current))
       current = []
-      const single = encodeExport(resource, [scopedSpan])
-      if (single.length > maxBytes) return { batches, oversizedSpan: single }
-      current.push(scopedSpan)
+      const single = encodeExport(resource, [envelopedSpan])
+      if (single.length > maxBytes) { oversizedSpans.push(single); continue }
+      current.push(envelopedSpan)
+      }
     }
     if (current.length) batches.push(encodeExport(resource, current))
   }
-  return { batches, oversizedSpan: null }
+  return { batches, oversizedSpans }
 }
 ```
 
-The concrete decoder must retain unknown protobuf fields verbatim and only split repeated span field `ScopeSpans.spans=2`; it must not JSON-round-trip OTLP.
+The concrete decoder must retain unknown protobuf fields verbatim and only split repeated span field `ScopeSpans.spans=2`; it must not JSON-round-trip OTLP. The sample names are schematic: the implementation must append `envelopedSpan`, not the original multi-span scope, and must continue across every later scope/resource after quarantining an oversize span. Add a mixed multi-resource test proving no span disappears after one oversize span.
 
 - [ ] **Step 4: Run split and correlation tests GREEN**
 
@@ -648,7 +652,7 @@ rtk git commit -m "feat(trace): recover durable outbox after crashes"
 - Modify: `apps/desktop/electron/trace-outbox-store.test.ts`
 
 **Interfaces:**
-- Produces: `quarantine(batchId, errorClass)`, `acknowledge(batchId, receipt)`, `compactIfIdle()`, and `diagnostics()`.
+- Produces: `quarantine(batchId, errorClass)`, `quarantineInput(input, errorClass)`, `acknowledge(batchId, receipt)`, `compactIfIdle()`, and `diagnostics()`.
 - Dedupe key is SHA-256 of `accountKey + entrypoint + hermesSessionId + runId + payloadSha256`.
 - Receipt tombstones retain 30 days and are independently capped at 64 MiB or 100,000 entries, whichever is reached first.
 
@@ -662,7 +666,7 @@ test('evicts oldest telemetry at hard limits, dedupes locally, and never touches
     root,
     maxBytes: 12,
     retentionMs: 30 * DAY,
-    freeSpace: () => ({ available: 20, total: 100 })
+    freeSpace: () => ({ available: 5 * ONE_GIB, total: 20 * ONE_GIB })
   }))
   const one = await store.enqueue(envelope('one', 8))
   await store.enqueue(envelope('two', 8))
@@ -689,18 +693,20 @@ Expected: FAIL because eviction, quarantine, tombstones, and dedupe are not impl
 ```ts
 private async ensureCapacity(incomingBytes: number, now: number): Promise<void> {
   await this.expireBefore(now - THIRTY_DAYS_MS)
-  const disk = await this.freeSpace()
-  const reserve = Math.max(ONE_GIB, Math.ceil(disk.total * 0.05))
-  while (this.payloadBytes + incomingBytes > this.maxBytes || disk.available - incomingBytes < reserve) {
+  while (true) {
+    const disk = await this.freeSpace()
+    const reserve = Math.max(ONE_GIB, Math.ceil(disk.total * 0.05))
+    if (this.payloadBytes + incomingBytes <= this.maxBytes && disk.available - incomingBytes >= reserve) return
     const oldest = this.oldestUnsentOrQuarantined()
     if (!oldest) throw new TraceOutboxError('storage_unavailable')
     await this.recordTerminal(oldest.batchId, 'evicted')
+    await this.reclaimFullyTerminalSegments()
     this.diagnosticsState.evictedCapacity += 1
   }
 }
 ```
 
-Quarantine is a journal state over encrypted bytes and counts toward 2 GiB. Accepted records become reclaimable only after receipt journal sync. Delete a segment only when every record is terminal/reclaimable; otherwise compact to a new synced segment only while `isConversationStreaming()` is false.
+Quarantine is a journal state over encrypted bytes and counts toward 2 GiB. `quarantineInput()` performs the normal compression, encryption, append, journal sync, and free-reserve/global-capacity checks, but bypasses only the 8 MiB normal-admission limit so a single oversize span is durably retained before returning its diagnostic response. Accepted records become reclaimable only after receipt journal sync. Delete a segment only when every record is terminal/reclaimable; otherwise compact to a new synced segment only while `isConversationStreaming()` is false. Refresh `freeSpace()` after every reclamation attempt; logical eviction alone must not be assumed to increase filesystem availability.
 
 - [ ] **Step 4: Run policy tests GREEN**
 
@@ -806,6 +812,7 @@ rtk git commit -m "fix(trace): serialize token refresh and retry scheduling"
 
 **Interfaces:**
 - `TraceForwarder` consumes `TraceOutboxStore`, `TraceOwner`, and `RefreshingTraceCredentialProvider`.
+- `TraceForwarder` consumes the narrow injected interface `RecoveryTrigger = { trigger(reason: TraceRecoveryReason): void }`; Task 10 tests it with a fake and does not construct the Task 11 controller.
 - `start(owner)` opens loopback admission without acquiring a Trace token.
 - Upstream headers add `Idempotency-Key` and `X-Trace-Payload-SHA256`.
 - HTTP 200/2xx is accepted only with matching `X-Trace-Batch-ID` and `X-Trace-Receipt: accepted|duplicate`.
@@ -841,8 +848,15 @@ Expected: FAIL because current `handle()` returns 200 immediately after an in-me
 - [ ] **Step 3: Replace the memory queue path**
 
 ```ts
-const durable = await this.store.enqueue({ ...metadata, body })
-respond(response, 200, true)
+const split = splitOtlpExportTraceRequest(body, MAX_LOGICAL_BATCH_BYTES)
+for (const oversizedSpan of split.oversizedSpans) {
+  await this.store.quarantineInput({ ...metadata, body: oversizedSpan }, 'payload_too_large')
+}
+const durable: DurableTraceBatch[] = []
+for (const batchBody of split.batches) {
+  durable.push(await this.store.enqueue({ ...metadata, body: batchBody }))
+}
+respond(response, split.oversizedSpans.length ? 422 : 200, true)
 this.recovery.trigger('durable-enqueue')
 
 const receipt = parseGatewayReceipt(response, batch.batchId)
@@ -852,7 +866,7 @@ if (receipt) {
 }
 ```
 
-Loopback body read is capped at 64 MiB; `splitOtlpExportTraceRequest(..., 8 * 1024 * 1024)` runs before enqueue. A single oversize span is encrypted into quarantine and Relay receives a non-success diagnostic response. Disk/key/reserve failures return HTTP 507 without claiming persistence. Gateway 400, 409, 413, and 415 quarantine; 401 refreshes only Trace credential and resends the same batch; 403 is forwarded as explicit revocation evidence; 429/5xx/network retain the head.
+Loopback body read is capped at 64 MiB; `splitOtlpExportTraceRequest(..., 8 * 1024 * 1024)` runs before enqueue and every normal split batch is enqueued in source order. Every oversize span is durably written through `quarantineInput()` before Relay receives a non-success diagnostic response; an oversize span never prevents later spans/resources from being admitted. Disk/key/reserve failures return HTTP 507 without claiming persistence. Gateway 400, 409, 413, and 415 quarantine; 401 refreshes only Trace credential and resends the same batch; 403 is forwarded as explicit revocation evidence; 429/5xx/network retain the head.
 
 - [ ] **Step 4: Run forwarder/outbox tests GREEN, then remove old queue files**
 
@@ -884,6 +898,7 @@ rtk git commit -m "feat(trace): forward from a durable encrypted outbox"
 - Produces `TraceRecoveryController.trigger(reason)` for `enqueue`, `startup`, `timer`, `renderer-online`, `resume`, `focus`, `token-ready`, `token-near-expiry`, and `upload-401`.
 - One pump per `TraceOwner.accountKey`; repeated triggers coalesce through a single pending promise.
 - Preload exposes only `window.hermes.traceOnline(): void`; renderer cannot pass account IDs, tokens, paths, or payloads.
+- Main-process setup takes a validated `TraceOwner` argument. On the standalone Trace branch it constructs only a legacy local-only owner from the existing principal digest and installation ID; Task 19 owns the mapping from Stream A's trusted account/Session fields.
 
 - [ ] **Step 1: Write failing trigger and non-blocking startup tests**
 
@@ -919,7 +934,7 @@ Expected: FAIL because no trigger controller exists and `ensureDesktopTraceForwa
 
 ```ts
 const forwarder = await TraceForwarder.create({
-  owner: traceOwnerFromScope(scope),
+  owner,
   root: path.join(app.getPath('userData'), 'trace-outbox'),
   keyProtector: electronSafeStorageProtector(safeStorage),
   credentialProvider: provider
@@ -931,6 +946,8 @@ void provider.current().then(() => forwarder.trigger('token-ready')).catch(() =>
 ```
 
 Register `powerMonitor.on('resume', ...)`, `mainWindow.on('focus', ...)`, periodic due timer, token-near-expiry timer, and guarded IPC `hermes:trace:online`. Stop only the pump/admission on sign-out or owner switch; never clear the account directory. Replace the source-reading test in `trace-forwarder.test.ts` with the injected runtime harness behavior above.
+
+Do not introduce or call `traceOwnerFromScope()` in this task. The standalone branch passes a validated `legacy-<principal_digest>` owner into the setup seam so data persists locally but cannot upload. Task 19 replaces only that call site after Stream A is integrated.
 
 - [ ] **Step 4: Run Electron tests, typecheck, and lint GREEN**
 

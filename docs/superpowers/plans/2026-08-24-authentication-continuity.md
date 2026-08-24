@@ -357,14 +357,17 @@ rtk git commit -m "feat(auth): add structured administrative revocation"
 - Modify: `agent-langfuse-server/auth-service/history/models.py`
 - Create: `agent-langfuse-server/auth-service/history/migrations/0007_trace_token_client_session.py`
 - Modify: `agent-langfuse-server/auth-service/history/trace_tokens.py`
+- Modify: `agent-langfuse-server/auth-service/history/client_sessions.py`
 - Modify: `agent-langfuse-server/auth-service/history/auth_views.py`
 - Modify: `agent-langfuse-server/auth-service/config/urls.py`
 - Modify: `agent-langfuse-server/auth-service/history/tests/test_trace_tokens.py`
 - Create: `agent-langfuse-server/auth-service/history/tests/test_native_trace_tokens.py`
+- Modify: `agent-langfuse-server/auth-service/history/tests/test_client_sessions.py`
 
 **Interfaces:**
 - Consumes: active Task 2 ClientSession resolution.
 - Produces nullable `TraceUploadToken.client_session`, `TraceUploadToken.revocation_reason`, `TraceTokenIntrospection`, route `native-trace-token`.
+- Produces a transactionally shared revocation hook: every Session sign-out/revoke and every account-wide revoke also revokes all bound Trace tokens before returning.
 - Active introspection adds `account_id,session_id,installation_id`; retains `platform_user_id,platform_username` during migration.
 
 - [ ] **Step 1: Write failing classification test**
@@ -406,6 +409,8 @@ class TraceTokenIntrospection:
 
 `issue_trace_token(*, client_session: ClientSession | None = None, user=None, session_key: str | None = None, installation_id: UUID | None = None) -> IssuedTraceToken` accepts exactly one authority form: `client_session`, or legacy `user+session_key+installation_id`. Classify malformed/unknown `invalid_token`; explicit Session/account state; expiry; rotated/revoked; wrong scope/audience `invalid_token`; otherwise active. Register bearer-only `POST /auth/api/client-session/trace-token/` named `native-trace-token`; preserve the legacy CSRF route.
 
+Extend the Task 2 revocation service rather than duplicating revocation in views/admin: `revoke_client_session()` revokes every active bound Trace token in the same transaction, and `revoke_account_sessions()` delegates through the same primitive for every Session. Add tests for user sign-out, selected-Session admin revoke, and account-wide revoke; each must leave retained Trace-token rows with `revoked_at` and `revocation_reason="revoked"`.
+
 - [ ] **Step 4: Run GREEN plus compatibility**
 
 ```bash
@@ -417,7 +422,7 @@ Expected: PASS; native reasons are exact and legacy issuance remains available.
 - [ ] **Step 5: Commit**
 
 ```bash
-rtk git add auth-service/history/models.py auth-service/history/migrations/0007_trace_token_client_session.py auth-service/history/trace_tokens.py auth-service/history/auth_views.py auth-service/config/urls.py auth-service/history/tests/test_trace_tokens.py auth-service/history/tests/test_native_trace_tokens.py
+rtk git add auth-service/history/models.py auth-service/history/migrations/0007_trace_token_client_session.py auth-service/history/trace_tokens.py auth-service/history/client_sessions.py auth-service/history/auth_views.py auth-service/config/urls.py auth-service/history/tests/test_trace_tokens.py auth-service/history/tests/test_native_trace_tokens.py auth-service/history/tests/test_client_sessions.py
 rtk git commit -m "feat(auth): bind trace credentials to native sessions"
 ```
 
@@ -557,10 +562,12 @@ class NativeSessionStatus:
 class ExplicitSessionRevocation(AuthServiceError):
     def __init__(self, *, code: str, account_id: str, session_id: str, revoked_at: str):
         super().__init__(code)
+        self.reason = code
+        self.code = code
         self.account_id, self.session_id, self.revoked_at = account_id, session_id, revoked_at
 ```
 
-Implement fixed-origin requests and exact headers. Construct `ExplicitSessionRevocation` only for exact keys, valid UUID/timestamp, `retryable is False`, a three-item explicit code, and identity equality to the cached credential. Mismatched 403 is `invalid_response`. Native Trace uses the new bearer route; legacy Trace receives a separate method name.
+Implement fixed-origin requests and exact headers. Construct `ExplicitSessionRevocation` only for exact keys, valid UUID/timestamp, `retryable is False`, a three-item explicit code, and identity equality to the cached credential. `reason` is the canonical internal terminal field; `code` is an equal wire-vocabulary alias, and tests require equality. Mismatched 403 is `invalid_response`. Native Trace uses the new bearer route; legacy Trace receives a separate method name.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -750,6 +757,7 @@ rtk git commit -m "feat(auth): restore durable local authorization offline"
 **Interfaces:**
 - Consumes: Task 8 public snapshot.
 - Produces `AUTH_BRIDGE_PROTOCOL_VERSION=2`, `NativeClientContext`, expanded `BridgeStatus`, validated status/login frames carrying native context.
+- Produces one exact preload-to-renderer adapter: the sanitized `BridgeStatus` object is forwarded unchanged and `DesktopAccountStatus` is a structural alias of the exported public status shape, with no second parser or divergent field list.
 - Renderer login remains `login(username,password)`; DesktopAuthBridge injects context.
 
 - [ ] **Step 1: Write failing exact round-trip test**
@@ -882,11 +890,10 @@ rtk git commit -m "fix(auth): preserve desktop scope during service outages"
 - Modify: `agent-hermes-client/apps/desktop/electron/main.ts`
 - Create: `agent-hermes-client/apps/desktop/electron/desktop-trace-startup.ts`
 - Create: `agent-hermes-client/apps/desktop/electron/desktop-trace-startup.test.ts`
-- Modify: `agent-hermes-client/apps/desktop/electron/trace-forwarder.test.ts`
 - Modify: `agent-hermes-client/apps/desktop/electron/desktop-runtime-gate.test.ts`
 
 **Interfaces:**
-- Consumes: Task 10 stable local scope and existing `TraceForwarder.start(epoch)` listener.
+- Consumes: Task 10 stable local scope and the existing token-independent `TraceForwarder.start(epoch)` listener.
 - Produces `prepareLocalTraceCapture(scope): Promise<TraceContext | null>`; backend waits only for local capture setup, never a cloud token.
 - Integration seam: Trace Stream replaces listener storage/pump internals without changing authentication authority.
 
@@ -906,15 +913,13 @@ test('backend preparation continues when local trace capture cannot start', asyn
 })
 ```
 
-Add a `trace-forwarder.test.ts` case with a real loopback listener and a provider whose `current()` rejects; `TraceForwarder.start(7)` must still return an endpoint before any local batch exists.
-
 - [ ] **Step 2: Run RED**
 
 ```bash
-rtk npm --prefix apps/desktop run test:desktop:platforms -- electron/trace-forwarder.test.ts electron/desktop-trace-startup.test.ts
+rtk npm --prefix apps/desktop run test:desktop:platforms -- electron/desktop-trace-startup.test.ts electron/desktop-runtime-gate.test.ts
 ```
 
-Expected: FAIL because `ensureDesktopTraceForwarder()` awaits `provider.current()` before backend preparation.
+Expected: FAIL because the new startup seam is absent and `ensureDesktopTraceForwarder()` awaits `provider.current()` before backend preparation.
 
 - [ ] **Step 3: Implement minimum decoupling**
 
@@ -940,7 +945,7 @@ export async function prepareLocalTraceCapture<T>({
 }
 ```
 
-In `ensureDesktopTraceForwarder`, remove credential preflight and retain local listener creation:
+In `ensureDesktopTraceForwarder`, remove credential preflight and retain local listener creation; Stream A does not otherwise modify `trace-forwarder.ts`, whose durable storage/pump internals belong to Stream B:
 
 ```typescript
 const forwarder = new TraceForwarder({ credentialProvider: provider, installationId: desktopInstallationId })
@@ -952,7 +957,7 @@ Implement `prepareLocalTraceCapture()` to catch listener/setup failure, emit onl
 - [ ] **Step 4: Run GREEN**
 
 ```bash
-rtk npm --prefix apps/desktop run test:desktop:platforms -- electron/desktop-trace-startup.test.ts electron/desktop-runtime-gate.test.ts electron/trace-forwarder.test.ts
+rtk npm --prefix apps/desktop run test:desktop:platforms -- electron/desktop-trace-startup.test.ts electron/desktop-runtime-gate.test.ts
 ```
 
 Expected: PASS; cloud token is not required for listener/backend, listener failure schedules retry without blocking backend, runtime gate stays ready while validation degrades.
@@ -960,7 +965,7 @@ Expected: PASS; cloud token is not required for listener/backend, listener failu
 - [ ] **Step 5: Commit**
 
 ```bash
-rtk git add apps/desktop/electron/main.ts apps/desktop/electron/desktop-trace-startup.ts apps/desktop/electron/desktop-trace-startup.test.ts apps/desktop/electron/trace-forwarder.test.ts apps/desktop/electron/desktop-runtime-gate.test.ts
+rtk git add apps/desktop/electron/main.ts apps/desktop/electron/desktop-trace-startup.ts apps/desktop/electron/desktop-trace-startup.test.ts apps/desktop/electron/desktop-runtime-gate.test.ts
 rtk git commit -m "fix(auth): decouple local runtime from trace credentials"
 ```
 
@@ -973,7 +978,7 @@ rtk git commit -m "fix(auth): decouple local runtime from trace credentials"
 - Modify: `agent-hermes-client/apps/desktop/src/i18n/auth-catalog.test.ts`
 
 **Interfaces:**
-- Consumes: Task 9 DesktopAccountStatus and Task 10 semantics.
+- Consumes: Task 9's sanitized public `BridgeStatus`, exposed through preload as the structurally identical `DesktopAccountStatus`, and Task 10 semantics.
 - Produces cached-authorization gate plus passive validation-health display.
 - Protected tree mounts for local authorization + runtime readiness and remains the same React instance through degradation/recovery.
 
