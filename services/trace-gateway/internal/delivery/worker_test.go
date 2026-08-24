@@ -59,6 +59,42 @@ func TestWorkerUsesFullJitterForRetry(t *testing.T) {
 	}
 }
 
+func TestWorkerSchedulesRetryFromFailedSendCompletion(t *testing.T) {
+	_, store := durableFixture(t, "one")
+	now := testNow
+	upstream := &fakeUpstream{
+		responses: []response{{status: 503}},
+		onSend:    func() { now = now.Add(3 * time.Minute) },
+	}
+	options := deterministicOptions(&now)
+	options.BaseRetry = 4 * time.Second
+
+	runOne(t, New(store, upstream, options))
+	nextRetry, err := store.NextRetryAt(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := testNow.Add(3*time.Minute + 4*time.Second); !nextRetry.Equal(want) {
+		t.Fatalf("next retry = %s, want %s", nextRetry, want)
+	}
+}
+
+func TestWorkerZeroJitterStillPersistsNonzeroRetryDelay(t *testing.T) {
+	_, store := durableFixture(t, "one")
+	now := testNow
+	options := deterministicOptions(&now)
+	options.Random = func() float64 { return 0 }
+
+	runOne(t, New(store, &fakeUpstream{responses: []response{{status: 503}}}, options))
+	nextRetry, err := store.NextRetryAt(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := testNow.Add(time.Millisecond); !nextRetry.Equal(want) {
+		t.Fatalf("next retry = %s, want %s", nextRetry, want)
+	}
+}
+
 func TestWorkerQuarantinesPermanentUpstreamRejection(t *testing.T) {
 	_, store := durableFixture(t, "one")
 	now := testNow
@@ -148,12 +184,16 @@ type fakeUpstream struct {
 	mu        sync.Mutex
 	responses []response
 	seen      []string
+	onSend    func()
 }
 
 func (u *fakeUpstream) Send(_ context.Context, payload []byte) (Response, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.seen = append(u.seen, string(payload))
+	if u.onSend != nil {
+		u.onSend()
+	}
 	if len(u.responses) == 0 {
 		return Response{Status: 200}, nil
 	}

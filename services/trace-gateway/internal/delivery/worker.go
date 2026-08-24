@@ -16,6 +16,9 @@ import (
 const (
 	defaultBaseRetry = time.Second
 	defaultMaxRetry  = 5 * time.Minute
+	// minimumRetryDelay prevents a zero-jitter retry from immediately spinning
+	// against the upstream while preserving any longer valid Retry-After value.
+	minimumRetryDelay = time.Millisecond
 )
 
 // Upstream sends canonical OTLP protobuf bytes. Implementations must not
@@ -126,8 +129,9 @@ func (w *Worker) deliverHead(ctx context.Context, now time.Time) (bool, error) {
 	case deliveryPermanent:
 		return true, w.store.MarkQuarantined(ctx, batch.AccountID, batch.BatchID, safeErrorClass(response.Status), now)
 	default:
+		retryNow := w.now()
 		retry := inbox.Retry{
-			NextRetry: fullJitter(batch.Attempts, now, response.RetryAfter, w.base, w.max, w.random),
+			NextRetry: fullJitter(batch.Attempts, retryNow, response.RetryAfter, w.base, w.max, w.random),
 			LastError: safeRetryErrorClass(response.Status, sendErr),
 		}
 		return true, w.store.MarkRetry(ctx, batch.AccountID, batch.BatchID, retry)
@@ -216,6 +220,9 @@ func fullJitter(attempts int, now time.Time, retryAfter string, base, max time.D
 	delay = time.Duration(float64(delay) * jitter)
 	if retryDelay := parseRetryAfter(retryAfter, now); retryDelay > delay {
 		delay = retryDelay
+	}
+	if delay < minimumRetryDelay {
+		delay = minimumRetryDelay
 	}
 	return now.Add(delay).UTC()
 }
