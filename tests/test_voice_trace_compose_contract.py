@@ -158,6 +158,18 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         self.assertNotIn("LANGFUSE_INIT_USER_PASSWORD", gateway_env)
         self.assertNotIn("Basic ", source)
 
+    def test_trace_gateway_has_private_durable_inbox_and_exact_safety_limits(self) -> None:
+        _, compose = self.load_compose()
+        gateway = compose["services"]["trace-gateway"]
+        self.assertEqual(
+            gateway.get("volumes"),
+            ["/data/ansatz-agent/voice-trace/data/trace-gateway:/data"],
+        )
+        self.assertEqual(gateway["environment"].get("TRACE_GATEWAY_INBOX_PATH"), "/data/inbox.db")
+        self.assertEqual(gateway["environment"].get("TRACE_GATEWAY_RECEIPT_RETENTION"), "720h")
+        self.assertEqual(gateway["environment"].get("TRACE_GATEWAY_MAX_DB_BYTES"), "68719476736")
+        self.assertEqual(gateway["environment"].get("TRACE_GATEWAY_MIN_FREE_BYTES"), "10737418240")
+
     def test_langfuse_is_public_url_signup_disabled_and_persistent(self) -> None:
         _, compose = self.load_compose()
         web_env = compose["services"]["langfuse-web"]["environment"]

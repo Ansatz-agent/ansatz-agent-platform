@@ -49,12 +49,15 @@ func (denyLimiter) Allow(string, string, time.Time) bool { return false }
 
 type recordingStore struct {
 	inbox.Store
-	result inbox.AcceptResult
-	err    error
+	result  inbox.AcceptResult
+	err     error
+	syncErr error
 
 	mu        sync.Mutex
 	envelopes []inbox.Envelope
 }
+
+func (s *recordingStore) Sync() error { return s.syncErr }
 
 func (s *recordingStore) Accept(_ context.Context, envelope inbox.Envelope) (inbox.AcceptResult, error) {
 	s.mu.Lock()
@@ -77,6 +80,13 @@ type blockingStore struct {
 	inbox.Store
 	accepted chan struct{}
 }
+
+type healthStore struct {
+	inbox.Store
+	syncErr error
+}
+
+func (s healthStore) Sync() error { return s.syncErr }
 
 func (s *blockingStore) Accept(_ context.Context, envelope inbox.Envelope) (inbox.AcceptResult, error) {
 	<-s.accepted
@@ -229,6 +239,21 @@ func TestHandlerExposesOnlyHealthAndTraceRoutes(t *testing.T) {
 		if response.Code != status {
 			t.Fatalf("%s status = %d, want %d", path, response.Code, status)
 		}
+	}
+}
+
+func TestHealthRejectsAdmissionWhenInboxIsNotWritable(t *testing.T) {
+	handler := mustHandler(t, Config{
+		Introspector: fakeIntrospector{},
+		Store:        healthStore{syncErr: inbox.ErrClosed},
+	})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", response.Header().Get("Cache-Control"))
 	}
 }
 

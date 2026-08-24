@@ -42,6 +42,12 @@ services:
       LANGFUSE_OTLP_TRACES_URL: http://langfuse-web:3000/langfuse/api/public/otel/v1/traces
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+      TRACE_GATEWAY_INBOX_PATH: /data/inbox.db
+      TRACE_GATEWAY_RECEIPT_RETENTION: 720h
+      TRACE_GATEWAY_MAX_DB_BYTES: "68719476736"
+      TRACE_GATEWAY_MIN_FREE_BYTES: "10737418240"
+    volumes:
+      - "${DEPLOY_ROOT}/data/trace-gateway:/data"
     networks:
       service:
         ipv4_address: 10.89.2.39

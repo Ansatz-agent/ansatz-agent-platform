@@ -116,6 +116,10 @@ func (s *Server) health(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
+	if err := s.store.Sync(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
