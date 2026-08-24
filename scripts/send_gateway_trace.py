@@ -230,7 +230,7 @@ def upload_user_trace(
     auth_base = credentials["AUTH_BASE_URL"].rstrip("/")
     origin = urlsplit(auth_base)
     public_base = f"{origin.scheme}://{origin.netloc}"
-    login_url = f"{auth_base}/accounts/login/"
+    login_url = f"{auth_base}/login/"
     token_url = f"{auth_base}/api/trace-token/"
     upload_url = f"{public_base}/trace-ingest/v1/traces"
     trace_id = trace_id or secrets.token_bytes(16)
@@ -253,7 +253,7 @@ def upload_user_trace(
     ) as client:
         login_page = client.get(login_url)
         _require(login_page, {200}, "login page")
-        csrf = client.cookies.get("agent_history_csrftoken")
+        csrf = client.cookies.get("__Host-ansatz_csrftoken")
         if not csrf:
             raise RuntimeError("login page did not set CSRF cookie")
         login = client.post(
@@ -266,7 +266,7 @@ def upload_user_trace(
             headers={"X-CSRFToken": csrf, "Referer": login_url},
         )
         _require(login, {302}, "login")
-        csrf = client.cookies.get("agent_history_csrftoken")
+        csrf = client.cookies.get("__Host-ansatz_csrftoken")
         if not csrf:
             raise RuntimeError("login did not preserve a CSRF cookie")
         token_response = client.post(

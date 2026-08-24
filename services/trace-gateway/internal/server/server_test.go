@@ -29,6 +29,7 @@ func (f fakeIntrospector) Introspect(_ context.Context, _ string) (auth.Principa
 	return auth.Principal{
 		TokenID:        "token-id",
 		UserID:         "42",
+		Username:       "yiyuxiao",
 		InstallationID: "11111111-1111-4111-8111-111111111111",
 		ExpiresAt:      time.Now().Add(time.Hour),
 		Scope:          "trace:write",

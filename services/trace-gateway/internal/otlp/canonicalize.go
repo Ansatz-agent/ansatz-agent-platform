@@ -20,24 +20,26 @@ type Headers struct {
 }
 
 var canonicalKeys = map[string]struct{}{
-	"platform.user.id":                {},
-	"user.id":                         {},
-	"langfuse.user.id":                {},
-	"client.installation.id":          {},
-	"hermes.session.id":               {},
-	"session.id":                      {},
-	"langfuse.session.id":             {},
-	"gen_ai.conversation.id":          {},
-	"hermes.entrypoint":               {},
-	"hermes.run.id":                   {},
-	"telemetry.schema.version":        {},
-	"trace.gateway.request.id":        {},
-	"langfuse.trace.input":            {},
-	"langfuse.trace.output":           {},
-	"langfuse.observation.type":       {},
-	"langfuse.observation.input":      {},
-	"langfuse.observation.output":     {},
-	"langfuse.observation.model.name": {},
+	"platform.user.id":                   {},
+	"user.id":                            {},
+	"langfuse.user.id":                   {},
+	"client.installation.id":             {},
+	"hermes.session.id":                  {},
+	"session.id":                         {},
+	"langfuse.session.id":                {},
+	"gen_ai.conversation.id":             {},
+	"hermes.entrypoint":                  {},
+	"hermes.run.id":                      {},
+	"telemetry.schema.version":           {},
+	"trace.gateway.request.id":           {},
+	"langfuse.trace.input":               {},
+	"langfuse.trace.output":              {},
+	"langfuse.observation.type":          {},
+	"langfuse.observation.input":         {},
+	"langfuse.observation.output":        {},
+	"langfuse.observation.model.name":    {},
+	"langfuse.observation.usage_details": {},
+	"langfuse.trace.metadata.username":   {},
 }
 
 func Canonicalize(
@@ -46,7 +48,7 @@ func Canonicalize(
 	headers Headers,
 	gatewayRequestID string,
 ) error {
-	if request == nil || principal.UserID == "" || principal.InstallationID == "" ||
+	if request == nil || principal.UserID == "" || principal.Username == "" || principal.InstallationID == "" ||
 		headers.SessionID == "" || headers.Entrypoint == "" || headers.RunID == "" ||
 		headers.SchemaVersion != "1" || gatewayRequestID == "" {
 		return errors.New("invalid canonical identity")
@@ -76,6 +78,7 @@ func Canonicalize(
 					span.Attributes,
 					stringAttribute("user.id", principal.UserID),
 					stringAttribute("langfuse.user.id", principal.UserID),
+					stringAttribute("langfuse.trace.metadata.username", principal.Username),
 					stringAttribute("session.id", headers.SessionID),
 					stringAttribute("langfuse.session.id", headers.SessionID),
 					stringAttribute("gen_ai.conversation.id", headers.SessionID),
@@ -97,6 +100,7 @@ func Canonicalize(
 			stringAttribute("platform.user.id", principal.UserID),
 			stringAttribute("user.id", principal.UserID),
 			stringAttribute("langfuse.user.id", principal.UserID),
+			stringAttribute("langfuse.trace.metadata.username", principal.Username),
 			stringAttribute("client.installation.id", principal.InstallationID),
 			stringAttribute("hermes.session.id", headers.SessionID),
 			stringAttribute("session.id", headers.SessionID),
@@ -150,7 +154,10 @@ func projectRelayForLangfuse(
 			attributes = append(attributes, stringAttribute("langfuse.observation.output", output))
 		}
 		if model, ok := stringValue(attributes, "nemo_relay.model_name"); ok {
-			attributes = append(attributes, stringAttribute("langfuse.observation.model.name", model))
+			attributes = append(attributes, stringAttribute("langfuse.observation.model.name", normalizeModelName(model)))
+		}
+		if usage, ok := relayUsageDetails(attributes); ok {
+			attributes = append(attributes, stringAttribute("langfuse.observation.usage_details", usage))
 		}
 	case scopeType == "tool":
 		attributes = append(attributes, stringAttribute("langfuse.observation.type", "span"))
@@ -162,6 +169,139 @@ func projectRelayForLangfuse(
 		}
 	}
 	return attributes
+}
+
+func normalizeModelName(model string) string {
+	parts := strings.Split(model, "/")
+	if len(parts) >= 3 && parts[0] != "" && parts[0] == parts[1] {
+		return strings.Join(parts[1:], "/")
+	}
+	return model
+}
+
+func relayUsageDetails(attributes []*commonpb.KeyValue) (string, bool) {
+	raw, ok := relayPayload(attributes, "nemo_relay.end.output.usage")
+	if !ok {
+		return "", false
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var usage map[string]any
+	if err := decoder.Decode(&usage); err != nil {
+		return "", false
+	}
+
+	input, hasInput := firstTokenCount(usage, []string{"prompt_tokens"}, []string{"input_tokens"})
+	output, hasOutput := firstTokenCount(usage, []string{"completion_tokens"}, []string{"output_tokens"})
+	total, hasTotal := firstTokenCount(usage, []string{"total_tokens"}, []string{"total"})
+	cacheRead, hasCacheRead := firstTokenCount(
+		usage,
+		[]string{"prompt_tokens_details", "cached_tokens"},
+		[]string{"input_tokens_details", "cached_tokens"},
+		[]string{"cache_read_input_tokens"},
+		[]string{"cache_read_tokens"},
+	)
+	cacheWrite, hasCacheWrite := firstTokenCount(
+		usage,
+		[]string{"prompt_tokens_details", "cache_creation_tokens"},
+		[]string{"input_tokens_details", "cache_creation_tokens"},
+		[]string{"cache_creation_input_tokens"},
+		[]string{"cache_write_tokens"},
+	)
+	reasoning, hasReasoning := firstTokenCount(
+		usage,
+		[]string{"completion_tokens_details", "reasoning_tokens"},
+		[]string{"output_tokens_details", "reasoning_tokens"},
+		[]string{"reasoning_tokens"},
+	)
+
+	details := make(map[string]int64)
+	if hasInput {
+		regularInput := input
+		_, hasPromptTokens := tokenCountAt(usage, []string{"prompt_tokens"})
+		_, hasNestedCachedTokens := firstTokenCount(
+			usage,
+			[]string{"prompt_tokens_details", "cached_tokens"},
+			[]string{"input_tokens_details", "cached_tokens"},
+		)
+		if hasPromptTokens || hasNestedCachedTokens {
+			regularInput = subtractTokenDetails(regularInput, cacheRead, cacheWrite)
+		}
+		details["input"] = regularInput
+	}
+	if hasOutput {
+		regularOutput := output
+		if hasReasoning {
+			regularOutput = subtractTokenDetails(regularOutput, reasoning)
+		}
+		details["output"] = regularOutput
+	}
+	if hasCacheRead {
+		details["input_cached_tokens"] = cacheRead
+	}
+	if hasCacheWrite {
+		details["input_cache_creation"] = cacheWrite
+	}
+	if hasReasoning {
+		details["output_reasoning_tokens"] = reasoning
+	}
+	if hasTotal {
+		details["total"] = total
+	} else if len(details) > 0 {
+		for key, value := range details {
+			if key != "total" {
+				total += value
+			}
+		}
+		details["total"] = total
+	}
+	if len(details) == 0 {
+		return "", false
+	}
+	rendered, err := json.Marshal(details)
+	if err != nil {
+		return "", false
+	}
+	return string(rendered), true
+}
+
+func firstTokenCount(value map[string]any, paths ...[]string) (int64, bool) {
+	for _, path := range paths {
+		if count, ok := tokenCountAt(value, path); ok {
+			return count, true
+		}
+	}
+	return 0, false
+}
+
+func tokenCountAt(value map[string]any, path []string) (int64, bool) {
+	var current any = value
+	for _, part := range path {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		current, ok = object[part]
+		if !ok {
+			return 0, false
+		}
+	}
+	number, ok := current.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	count, err := number.Int64()
+	return count, err == nil && count >= 0
+}
+
+func subtractTokenDetails(total int64, details ...int64) int64 {
+	for _, detail := range details {
+		if detail >= total {
+			return 0
+		}
+		total -= detail
+	}
+	return total
 }
 
 func preferredRelayPayload(

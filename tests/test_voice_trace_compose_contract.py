@@ -18,7 +18,7 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         source = COMPOSE_PATH.read_text(encoding="utf-8")
         digest = "sha256:" + "a" * 64
         variables = {
-            "DEPLOY_ROOT": "/root/ansatz-agent/voice-trace-20260823",
+            "DEPLOY_ROOT": "/data/ansatz-agent/voice-trace",
             "NPM_NETWORK": "nginx-proxy-manager_default",
             "AUTH_SERVICE_IMAGE": "localhost/ansatz-auth-service:d728ff78fd8b",
             "TRACE_GATEWAY_IMAGE": "localhost/ansatz-trace-gateway:615a97a0f2dd",
@@ -116,9 +116,9 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         }
         for name, networks in expected.items():
             self.assertEqual(set(compose["services"][name]["networks"]), networks, name)
-        self.assertIn(
-            "agent-history-web",
-            compose["services"]["auth-service"]["networks"]["service"]["aliases"],
+        self.assertNotIn(
+            "aliases",
+            compose["services"]["auth-service"]["networks"]["service"],
         )
         self.assertEqual(
             compose["services"]["auth-service"]["networks"]["service"]["ipv4_address"],
@@ -149,7 +149,12 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
             gateway_env["LANGFUSE_OTLP_TRACES_URL"],
             "http://langfuse-web:3000/langfuse/api/public/otel/v1/traces",
         )
-        self.assertNotIn("LANGFUSE_INIT_PROJECT_SECRET_KEY", auth_env)
+        self.assertEqual(
+            auth_env["LANGFUSE_INTERNAL_BASE_URL"],
+            "http://langfuse-web:3000/langfuse/api/public",
+        )
+        self.assertEqual(auth_env["LANGFUSE_PROJECT_PUBLIC_KEY"], "pk-lf-redacted")
+        self.assertEqual(auth_env["LANGFUSE_PROJECT_SECRET_KEY"], "sk-lf-redacted")
         self.assertNotIn("LANGFUSE_INIT_USER_PASSWORD", gateway_env)
         self.assertNotIn("Basic ", source)
 
@@ -168,12 +173,12 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         self.assertEqual(web_env["TELEMETRY_ENABLED"], "false")
         self.assertEqual(
             compose["services"]["auth-service"]["volumes"],
-            ["/var/lib/agent-history:/data"],
+            ["/data/ansatz-agent/voice-trace/data/auth:/data"],
         )
-        for name in ("postgres", "clickhouse", "redis", "minio"):
+        for name in ("auth-service", "postgres", "clickhouse", "redis", "minio"):
             for mount in compose["services"][name].get("volumes", []):
                 source = mount.split(":", 1)[0]
-                self.assertTrue(source.startswith("/root/ansatz-agent/voice-trace-20260823/data/"), source)
+                self.assertTrue(source.startswith("/data/ansatz-agent/voice-trace/data/"), source)
 
     def test_minio_creates_the_langfuse_bucket_before_serving(self) -> None:
         _, compose = self.load_compose()
@@ -191,6 +196,7 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         self.assertIn("bootstrap-voice-trace-secrets.sh", text)
         for forbidden in ("CHANGEME", "password=", "sk-lf-", "Basic ", ":latest"):
             self.assertNotIn(forbidden, text)
+        self.assertIn("DEPLOY_ROOT=/data/ansatz-agent/voice-trace", text)
         for required in (
             "DJANGO_SECRET_KEY",
             "TRACE_GATEWAY_INTERNAL_SECRET",
