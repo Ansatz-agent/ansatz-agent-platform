@@ -36,6 +36,7 @@ type BoltStore struct {
 	writeMu          sync.Mutex
 	closed           bool
 	pageSize         int
+	allocSize        int
 }
 
 type storedBatch struct {
@@ -70,7 +71,7 @@ func Open(path string, options Options) (*BoltStore, error) {
 	if path == "" {
 		return nil, errors.New("trace inbox path is required")
 	}
-	if options.ReceiptRetention < 0 || options.MaxDBBytes < 0 || options.MinFreeBytes < 0 || options.OpenTimeout < 0 {
+	if options.ReceiptRetention < 0 || options.MaxDBBytes < 0 || options.MinFreeBytes < 0 || options.AllocSize < 0 || options.OpenTimeout < 0 {
 		return nil, errors.New("trace inbox options must not be negative")
 	}
 	if options.ReceiptRetention == 0 {
@@ -87,11 +88,15 @@ func Open(path string, options Options) (*BoltStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open trace inbox: %w", err)
 	}
+	if options.AllocSize > 0 {
+		db.AllocSize = options.AllocSize
+	}
 	store := &BoltStore{
 		db:               db,
 		receiptRetention: options.ReceiptRetention,
 		now:              options.Now,
 		pageSize:         db.Info().PageSize,
+		allocSize:        db.AllocSize,
 	}
 	store.syncFn = db.Sync
 	if options.StorageGuard != nil {
@@ -164,7 +169,7 @@ func (s *BoltStore) Accept(ctx context.Context, env Envelope) (AcceptResult, err
 		if err != nil {
 			return err
 		}
-		if err := s.storageGuard.Check(projectedAcceptanceGrowth(s.pageSize, key, batchBytes, receiptBytes)); err != nil {
+		if err := s.storageGuard.Check(projectedAcceptanceGrowth(s.pageSize, s.allocSize, key, batchBytes, receiptBytes)); err != nil {
 			return err
 		}
 		fifoKey := sequenceKey(sequence)
@@ -432,28 +437,31 @@ func sequenceKey(sequence uint64) []byte {
 	return key
 }
 
-const (
-	bboltLeafElementBytes    = int64(16)
-	bboltAcceptanceSafePages = int64(32)
-)
+const bboltLeafElementBytes = int64(16)
 
 // projectedAcceptanceGrowth accounts for the exact JSON-encoded batch and
 // receipt (including base64 payload expansion), all three bucket key/value
 // pairs, and bbolt leaf-element overhead. It rounds data to whole pages,
-// doubles those pages for copy-on-write leaf splits, then adds thirty-two pages
-// for branch splits and freelist growth. Admission may therefore reject early,
-// but never treats raw payload length as the expected on-disk growth.
-func projectedAcceptanceGrowth(pageSize int, key, batch, receipt []byte) int64 {
-	if pageSize <= 0 {
+// doubles those pages for copy-on-write growth, then adds the opened database's
+// AllocSize rounded up to a page. bbolt grow() can extend the file by that full
+// allocation chunk beyond requested pages. Admission may therefore reject
+// early, but never treats raw payload length as expected on-disk growth.
+func projectedAcceptanceGrowth(pageSize, allocSize int, key, batch, receipt []byte) int64 {
+	if pageSize <= 0 || allocSize < 0 {
 		return math.MaxInt64
 	}
-	recordBytes := int64(len(batch)+len(receipt)+3*len(key)+8) + 3*bboltLeafElementBytes
+	recordBytes := int64(len(batch)) + int64(len(receipt)) + 3*int64(len(key)) + 8 + 3*bboltLeafElementBytes
 	pageBytes := int64(pageSize)
-	dataPages := (recordBytes + pageBytes - 1) / pageBytes
-	projectedPages := 2*dataPages + bboltAcceptanceSafePages
-	if projectedPages > math.MaxInt64/pageBytes {
+	if recordBytes > math.MaxInt64-pageBytes+1 || int64(allocSize) > math.MaxInt64-pageBytes+1 {
 		return math.MaxInt64
 	}
+	dataPages := (recordBytes + pageBytes - 1) / pageBytes
+	allocPages := (int64(allocSize) + pageBytes - 1) / pageBytes
+	maxPages := math.MaxInt64 / pageBytes
+	if allocPages > maxPages || dataPages > (maxPages-allocPages)/2 {
+		return math.MaxInt64
+	}
+	projectedPages := 2*dataPages + allocPages
 	return projectedPages * pageBytes
 }
 

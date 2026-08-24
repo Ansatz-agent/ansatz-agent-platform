@@ -66,6 +66,7 @@ type Options struct {
 	ReceiptRetention time.Duration
 	MaxDBBytes       int64
 	MinFreeBytes     int64
+	AllocSize        int
 	OpenTimeout      time.Duration
 	Now              func() time.Time
 	StorageGuard     StorageGuard

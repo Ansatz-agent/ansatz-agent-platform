@@ -306,6 +306,99 @@ func TestBoltStoreProjectsEncodedPageGrowthAgainstMinFreeBytes(t *testing.T) {
 	}
 }
 
+func TestBoltStoreBudgetsAllocSizeAtActualFileGrowthBoundaries(t *testing.T) {
+	pageSize := int64(os.Getpagesize())
+	projectedGrowth := 3 * pageSize // one encoded page, one COW page, one AllocSize page
+
+	t.Run("MaxDBBytes", func(t *testing.T) {
+		path, baseline := initializedStoreFile(t, int(pageSize))
+		maximum := baseline + projectedGrowth
+		store, err := Open(path, Options{
+			ReceiptRetention: 30 * 24 * time.Hour,
+			MaxDBBytes:       maximum,
+			AllocSize:        int(pageSize),
+			Now:              func() time.Time { return testNow },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if _, err := store.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("x"))); err != nil {
+			t.Fatal(err)
+		}
+		if got := fileSize(t, path); got > maximum {
+			t.Fatalf("post-sync size = %d, maximum = %d", got, maximum)
+		}
+
+		tightPath, tightBaseline := initializedStoreFile(t, int(pageSize))
+		tight, err := Open(tightPath, Options{
+			ReceiptRetention: 30 * 24 * time.Hour,
+			MaxDBBytes:       tightBaseline + projectedGrowth - 1,
+			AllocSize:        int(pageSize),
+			Now:              func() time.Time { return testNow },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = tight.Close() })
+		if _, err := tight.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("x"))); !errors.Is(err, ErrStorageUnavailable) {
+			t.Fatalf("tight error = %v", err)
+		}
+		if got := countCanonicalBatches(t, tight); got != 0 {
+			t.Fatalf("tight committed batches = %d", got)
+		}
+	})
+
+	t.Run("MinFreeBytes", func(t *testing.T) {
+		path, baseline := initializedStoreFile(t, int(pageSize))
+		available := 2 * projectedGrowth
+		minimum := projectedGrowth
+		store, err := Open(path, Options{
+			ReceiptRetention: 30 * 24 * time.Hour,
+			AllocSize:        int(pageSize),
+			Now:              func() time.Time { return testNow },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		store.storageGuard = fileStorageGuard{
+			minFreeBytes:   minimum,
+			sizeBytes:      func() (int64, error) { return fileSize(t, path), nil },
+			availableBytes: func() (int64, error) { return available, nil },
+		}
+		if _, err := store.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("x"))); err != nil {
+			t.Fatal(err)
+		}
+		actualGrowth := fileSize(t, path) - baseline
+		if remaining := available - actualGrowth; remaining < minimum {
+			t.Fatalf("post-sync free = %d, minimum = %d", remaining, minimum)
+		}
+
+		tightPath, _ := initializedStoreFile(t, int(pageSize))
+		tight, err := Open(tightPath, Options{
+			ReceiptRetention: 30 * 24 * time.Hour,
+			AllocSize:        int(pageSize),
+			Now:              func() time.Time { return testNow },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = tight.Close() })
+		tight.storageGuard = fileStorageGuard{
+			minFreeBytes:   minimum + 1,
+			sizeBytes:      func() (int64, error) { return fileSize(t, tightPath), nil },
+			availableBytes: func() (int64, error) { return available, nil },
+		}
+		if _, err := tight.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("x"))); !errors.Is(err, ErrStorageUnavailable) {
+			t.Fatalf("tight error = %v", err)
+		}
+		if got := countCanonicalBatches(t, tight); got != 0 {
+			t.Fatalf("tight committed batches = %d", got)
+		}
+	})
+}
+
 func TestBoltStoreZeroDeliveryTimeUsesStoreClockForReceiptCollection(t *testing.T) {
 	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
 	if _, err := store.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("x"))); err != nil {
@@ -373,6 +466,32 @@ func openTestStore(t *testing.T, path string) *BoltStore {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+func initializedStoreFile(t *testing.T, allocSize int) (string, int64) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "inbox.db")
+	store, err := Open(path, Options{
+		ReceiptRetention: 30 * 24 * time.Hour,
+		AllocSize:        allocSize,
+		Now:              func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path, fileSize(t, path)
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
 }
 
 func validEnvelope(accountID, batchID string, payload []byte) Envelope {
