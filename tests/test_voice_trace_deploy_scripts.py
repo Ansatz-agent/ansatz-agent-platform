@@ -16,19 +16,20 @@ class VoiceTraceDeployScriptContractTest(unittest.TestCase):
     def test_deploy_is_exact_scoped_backup_first_and_non_destructive(self) -> None:
         source = self.read("deploy-voice-trace.sh")
         self.assertIn("REMOTE_HOST=hermes", source)
-        self.assertIn("REMOTE_ROOT=/root/ansatz-agent/voice-trace-20260823", source)
+        self.assertIn("REMOTE_ROOT=/data/ansatz-agent/voice-trace", source)
         self.assertIn("COMPOSE_PROJECT=ansatz-voice-trace-20260823", source)
-        self.assertIn("bash /opt/agent-history-portal/scripts/backup.sh", source)
-        self.assertLess(
-            source.index("bash /opt/agent-history-portal/scripts/backup.sh"),
-            source.index("systemctl stop agent-history-portal.service"),
-        )
-        self.assertIn("docker load", source)
+        self.assertNotIn("agent-history-portal.service", source)
+        self.assertIn("ansatz-auth-traces-images-20260824.tar.gz", source)
+        self.assertIn("podman load", source)
         self.assertIn("/usr/bin/podman-compose", source)
         self.assertIn("config > /dev/null", source)
         self.assertIn(
             'bash "$SCRIPT_DIR/configure-voice-trace-npm.sh"',
             source,
+        )
+        self.assertLess(
+            source.index('bash "$SCRIPT_DIR/configure-voice-trace-npm.sh"'),
+            source.index('bash "$SCRIPT_DIR/check-voice-trace.sh"'),
         )
         self.assertNotIn("docker system prune", source)
         self.assertNotIn("docker volume prune", source)
@@ -49,8 +50,14 @@ class VoiceTraceDeployScriptContractTest(unittest.TestCase):
             "/trace-gateway healthcheck",
             "published port detected",
             ":3000/langfuse/api/public/health",
+            "https://c2sml.cn/agent",
+            "https://c2sml.cn/auth/login/",
+            "https://c2sml.cn/traces/",
+            "https://c2sml.cn/langfuse/",
         ):
             self.assertIn(required, source)
+        for code in ('"404"', '"200"', '"302"'):
+            self.assertIn(code, source)
         self.assertNotIn("PASSWORD", source)
         self.assertNotIn("LANGFUSE_SECRET_KEY", source)
 
@@ -58,9 +65,12 @@ class VoiceTraceDeployScriptContractTest(unittest.TestCase):
         source = self.read("configure-voice-trace-npm.sh")
         for required in (
             "REMOTE_HOST=hermes",
+            "REMOTE_ROOT=/data/ansatz-agent/voice-trace",
             "NPM_ROOT=/root/nginx-proxy-manager",
             "server_proxy.conf",
             "update_npm_compose.py",
+            "database.sqlite",
+            "proxy_host/1.conf",
             "podman-compose",
             "config > /dev/null",
             "--force-recreate",
@@ -79,6 +89,11 @@ class VoiceTraceDeployScriptContractTest(unittest.TestCase):
         self.assertNotIn("sed -i", source)
         self.assertNotIn("system prune", source)
         self.assertNotIn("rm -rf", source)
+
+    def test_check_uses_data_release_root(self) -> None:
+        source = self.read("check-voice-trace.sh")
+        self.assertIn("REMOTE_ROOT=/data/ansatz-agent/voice-trace", source)
+        self.assertIn("COMPOSE_PROJECT=ansatz-voice-trace-20260823", source)
 
 
 if __name__ == "__main__":

@@ -39,7 +39,6 @@ class UpdateNpmComposeTest(unittest.TestCase):
             config["services"]["npm"]["extra_hosts"],
             [
                 "cv-php8:10.89.0.45",
-                "agent-history-web:10.89.2.32",
                 "auth-service:10.89.2.32",
                 "trace-gateway:10.89.2.39",
                 "langfuse-web:10.89.2.38",
@@ -58,6 +57,36 @@ class UpdateNpmComposeTest(unittest.TestCase):
         once = module.update_extra_hosts(source)
         twice = module.update_extra_hosts(once)
 
+        self.assertEqual(twice, once)
+
+    def test_removes_only_legacy_agent_locations_and_is_idempotent(self) -> None:
+        source = """location /agentic/ {
+    return 200;
+}
+
+location ^~ /agent/healthz {
+    return 404;
+}
+
+location ^~ /agent/ {
+    proxy_set_header X-Test "value with } text";
+    proxy_pass http://agent-history-web:8000;
+}
+
+location /kept/ {
+    return 204;
+}
+"""
+        module = load_module()
+
+        once = module.remove_legacy_agent_locations(source)
+        twice = module.remove_legacy_agent_locations(once)
+
+        self.assertNotIn("location ^~ /agent/healthz", once)
+        self.assertNotIn("location ^~ /agent/ {", once)
+        self.assertNotIn("agent-history-web", once)
+        self.assertIn("location /agentic/", once)
+        self.assertIn("location /kept/", once)
         self.assertEqual(twice, once)
 
 

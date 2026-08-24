@@ -8,18 +8,16 @@ services:
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
       DJANGO_ALLOWED_HOSTS: c2sml.cn,auth-service,localhost,127.0.0.1
       DJANGO_CSRF_TRUSTED_ORIGINS: https://c2sml.cn
-      DJANGO_SCRIPT_NAME: /agent
-      DJANGO_SESSION_COOKIE_NAME: agent_history_sessionid
-      DJANGO_CSRF_COOKIE_NAME: agent_history_csrftoken
       DJANGO_DB_PATH: /data/db.sqlite3
       TRACE_GATEWAY_INTERNAL_SECRET: ${TRACE_GATEWAY_INTERNAL_SECRET}
+      LANGFUSE_INTERNAL_BASE_URL: http://langfuse-web:3000/langfuse/api/public
+      LANGFUSE_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
     volumes:
-      - "/var/lib/agent-history:/data"
+      - "${DEPLOY_ROOT}/data/auth:/data"
     networks:
       service:
         ipv4_address: 10.89.2.32
-        aliases:
-          - agent-history-web
     healthcheck:
       test:
         - CMD
