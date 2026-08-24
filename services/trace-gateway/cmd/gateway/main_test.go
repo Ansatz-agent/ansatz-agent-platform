@@ -90,6 +90,7 @@ func TestLoadRuntimeConfigAcceptsOnlySafeAbsoluteServiceEndpointURLs(t *testing.
 		{"rejects malformed introspection endpoint", "AUTH_INTROSPECTION_URL", "https://%", "invalid URL"},
 		{"rejects relative introspection endpoint", "AUTH_INTROSPECTION_URL", "/internal/trace-token/introspect/", "invalid URL"},
 		{"rejects introspection endpoint without host", "AUTH_INTROSPECTION_URL", "https:/internal/trace-token/introspect/", "invalid URL"},
+		{"rejects introspection endpoint with port but no hostname", "AUTH_INTROSPECTION_URL", "https://:8080/internal/", "invalid URL"},
 		{"rejects introspection endpoint with invalid port", "AUTH_INTROSPECTION_URL", "https://auth.example.test:not-a-port/internal/", "invalid URL"},
 		{"rejects introspection endpoint with out of range port", "AUTH_INTROSPECTION_URL", "https://auth.example.test:65536/internal/", "invalid URL"},
 		{"rejects introspection credentials", "AUTH_INTROSPECTION_URL", "https://user:password@auth.example.test/internal/", "invalid URL"},
@@ -97,9 +98,11 @@ func TestLoadRuntimeConfigAcceptsOnlySafeAbsoluteServiceEndpointURLs(t *testing.
 		{"rejects introspection fragment", "AUTH_INTROSPECTION_URL", "https://auth.example.test/internal/#secret", "invalid URL"},
 		{"rejects introspection FTP", "AUTH_INTROSPECTION_URL", "ftp://auth.example.test/internal/", "invalid URL"},
 		{"rejects upstream credentials", "LANGFUSE_OTLP_TRACES_URL", "https://user:password@langfuse.example.test/v1/traces", "invalid URL"},
+		{"rejects upstream endpoint with port but no hostname", "LANGFUSE_OTLP_TRACES_URL", "https://:8080/v1/traces", "invalid URL"},
 		{"rejects upstream query", "LANGFUSE_OTLP_TRACES_URL", "https://langfuse.example.test/v1/traces?key=secret", "invalid URL"},
 		{"rejects upstream fragment", "LANGFUSE_OTLP_TRACES_URL", "https://langfuse.example.test/v1/traces#secret", "invalid URL"},
 		{"rejects upstream non-HTTP scheme", "LANGFUSE_OTLP_TRACES_URL", "file:///private/trace", "invalid URL"},
+		{"accepts IPv6 endpoint with explicit port", "AUTH_INTROSPECTION_URL", "https://[2001:db8::1]:8443/internal/", ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

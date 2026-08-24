@@ -221,7 +221,7 @@ func requiredServiceURLFrom(getenv func(string) string, name string) (string, er
 		return "", err
 	}
 	parsed, err := url.ParseRequestURI(value)
-	if strings.Contains(value, "#") || err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if strings.Contains(value, "#") || err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", fmt.Errorf("invalid URL for environment variable: %s", name)
 	}
 	if port := parsed.Port(); port != "" {
