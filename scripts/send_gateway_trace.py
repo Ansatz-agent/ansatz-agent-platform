@@ -9,6 +9,7 @@ import os
 import secrets
 import struct
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -205,6 +206,15 @@ def _require(response: httpx.Response, expected: set[int], boundary: str) -> Non
         raise RuntimeError(f"{boundary} returned HTTP {response.status_code}")
 
 
+def _require_receipt(response: httpx.Response, batch_id: str, expected: str) -> str:
+    if response.headers.get("x-trace-batch-id") != batch_id:
+        raise RuntimeError("trace upload returned a mismatched batch receipt")
+    receipt = response.headers.get("x-trace-receipt")
+    if receipt != expected:
+        raise RuntimeError("trace upload returned an unexpected receipt")
+    return receipt
+
+
 def upload_user_trace(
     credentials: dict[str, str],
     label: str,
@@ -244,6 +254,8 @@ def upload_user_trace(
         root_span_id=root_span_id,
         start_ns=start_ns,
     )
+    batch_id = str(uuid.uuid4())
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
 
     with httpx.Client(
         transport=transport,
@@ -299,11 +311,15 @@ def upload_user_trace(
             "X-Trace-Entrypoint": "voice" if label == "B" else "desktop",
             "X-Trace-Run-ID": run_id,
             "X-Telemetry-Schema-Version": "1",
+            "Idempotency-Key": batch_id,
+            "X-Trace-Payload-SHA256": payload_sha256,
         }
         upload = client.post(upload_url, content=payload, headers=headers)
         _require(upload, {200}, "trace upload")
+        first_receipt = _require_receipt(upload, batch_id, "accepted")
         retry = client.post(upload_url, content=payload, headers=headers)
         _require(retry, {200}, "identical trace retry")
+        retry_receipt = _require_receipt(retry, batch_id, "duplicate")
 
     return {
         "label": label,
@@ -316,6 +332,8 @@ def upload_user_trace(
         "entrypoint": "voice" if label == "B" else "desktop",
         "upload_status": upload.status_code,
         "retry_status": retry.status_code,
+        "first_receipt": first_receipt,
+        "retry_receipt": retry_receipt,
     }
 
 

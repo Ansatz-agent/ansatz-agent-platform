@@ -51,11 +51,12 @@ class SendGatewayTraceTest(unittest.TestCase):
         ):
             self.assertIn(semantic, first)
 
-    def test_real_http_flow_uses_session_token_and_retries_identical_bytes(self) -> None:
+    def test_retry_reuses_batch_and_digest_and_requires_durable_receipts(self) -> None:
         module = load_module()
         password = "password-sentinel-that-must-not-be-returned"
         upload_token = "upload-token-sentinel-12345678901234567890"
         payloads: list[bytes] = []
+        uploads: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET" and request.url.path == "/auth/login/":
@@ -97,10 +98,16 @@ class SendGatewayTraceTest(unittest.TestCase):
                 self.assertEqual(request.headers["authorization"], f"Bearer {upload_token}")
                 self.assertEqual(request.headers["content-type"], "application/x-protobuf")
                 payloads.append(request.content)
+                uploads.append(request)
+                receipt = "accepted" if len(uploads) == 1 else "duplicate"
                 return httpx.Response(
                     200,
                     content=b"\x0a\x00",
-                    headers={"content-type": "application/x-protobuf"},
+                    headers={
+                        "content-type": "application/x-protobuf",
+                        "x-trace-batch-id": request.headers["idempotency-key"],
+                        "x-trace-receipt": receipt,
+                    },
                 )
             raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
@@ -124,6 +131,18 @@ class SendGatewayTraceTest(unittest.TestCase):
         self.assertEqual(result["retry_status"], 200)
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[0], payloads[1])
+        self.assertEqual(len({request.headers["idempotency-key"] for request in uploads}), 1)
+        batch_id = uploads[0].headers["idempotency-key"]
+        self.assertRegex(
+            batch_id,
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+        self.assertEqual(
+            {request.headers["x-trace-payload-sha256"] for request in uploads},
+            {module.hashlib.sha256(payloads[0]).hexdigest()},
+        )
+        self.assertEqual(result["first_receipt"], "accepted")
+        self.assertEqual(result["retry_receipt"], "duplicate")
         self.assertNotIn(password, json.dumps(result))
         self.assertNotIn(upload_token, json.dumps(result))
 
