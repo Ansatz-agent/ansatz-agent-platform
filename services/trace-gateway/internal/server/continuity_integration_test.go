@@ -34,6 +34,7 @@ func TestLostClientResponseAndGatewayRestartKeepOneLogicalBatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inbox.db")
 	upstream := newContinuityUpstream()
 	first := newGatedContinuityGateway(t, path, upstream, "first-token-id")
+	t.Cleanup(func() { first.Close(t) })
 
 	sendAndAbandonAfterDurableAccept(t, first, continuityBearerOne, validBody(t))
 	first.WaitForResponseWriteFailure(t)
@@ -44,7 +45,7 @@ func TestLostClientResponseAndGatewayRestartKeepOneLogicalBatch(t *testing.T) {
 
 	upstream.SetHealthy(true)
 	second := newContinuityGateway(t, path, upstream, "replacement-token-id")
-	defer second.Close(t)
+	t.Cleanup(func() { second.Close(t) })
 
 	retry := postContinuityTrace(t, second.http.URL, continuityBearerTwo, validBody(t))
 	defer retry.Body.Close()
@@ -80,13 +81,40 @@ func TestLostClientResponseAndGatewayRestartKeepOneLogicalBatch(t *testing.T) {
 	}
 }
 
+func TestAcceptGateStoreReturnsOnContextCancellationAfterDurableAcceptance(t *testing.T) {
+	gate := newAcceptGateStore(&recordingStore{result: inbox.AcceptResult{BatchID: batchID, Outcome: inbox.ReceiptAccepted}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := gate.Accept(ctx, inbox.Envelope{})
+		done <- err
+	}()
+	select {
+	case <-gate.accepted:
+	case <-time.After(time.Second):
+		t.Fatal("durable acceptance did not reach the gate")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("gate error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gate remained blocked after context cancellation")
+	}
+}
+
 type continuityGateway struct {
 	store         *inbox.BoltStore
 	http          *httptest.Server
 	cancel        context.CancelFunc
 	workerDone    <-chan error
 	workerStopped bool
+	closed        bool
 	gate          *acceptGateStore
+	writeGate     *responseWriteGate
 	writeErrors   <-chan error
 }
 
@@ -132,11 +160,15 @@ func newContinuityGatewayWithAdmissionGate(t *testing.T, path string, upstream *
 		t.Fatal(err)
 	}
 	writeErrors := make(chan error, 1)
+	var writeGate *responseWriteGate
+	if gated {
+		writeGate = newResponseWriteGate()
+	}
 	httpServer := httptest.NewUnstartedServer(gateway.Handler())
-	httpServer.Listener = &responseObservingListener{Listener: listener, writeErrors: writeErrors}
+	httpServer.Listener = &responseObservingListener{Listener: listener, writeErrors: writeErrors, writeGate: writeGate}
 	httpServer.Start()
 	return &continuityGateway{
-		store: store, http: httpServer, cancel: cancel, workerDone: workerDone, gate: gate, writeErrors: writeErrors,
+		store: store, http: httpServer, cancel: cancel, workerDone: workerDone, gate: gate, writeGate: writeGate, writeErrors: writeErrors,
 	}
 }
 
@@ -146,8 +178,25 @@ func newGatedContinuityGateway(t *testing.T, path string, upstream *continuityUp
 
 func (g *continuityGateway) Close(t *testing.T) {
 	t.Helper()
+	if g.closed {
+		return
+	}
+	g.closed = true
+	if g.gate != nil {
+		g.gate.Release()
+	}
+	var workerDone <-chan error
+	if !g.workerStopped {
+		g.workerStopped = true
+		g.cancel()
+		workerDone = g.workerDone
+	}
 	g.http.Close()
-	g.StopWorker(t)
+	if workerDone != nil {
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker shutdown: %v", err)
+		}
+	}
 	if err := g.store.Close(); err != nil {
 		t.Errorf("store close: %v", err)
 	}
@@ -323,33 +372,39 @@ func sendAndAbandonAfterDurableAccept(t *testing.T, gateway *continuityGateway, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		_ = connection.Close()
+		gateway.gate.Release()
+		gateway.writeGate.Release()
+	}()
 	digest := sha256.Sum256(body)
 	headers := fmt.Sprintf(
 		"POST /v1/traces HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nContent-Type: application/x-protobuf\r\nContent-Encoding: identity\r\nX-Hermes-Session-ID: continuity-session\r\nX-Trace-Entrypoint: desktop\r\nX-Trace-Run-ID: continuity-run\r\nX-Telemetry-Schema-Version: 1\r\nIdempotency-Key: %s\r\nX-Trace-Payload-SHA256: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
 		parsed.Host, bearer, batchID, hex.EncodeToString(digest[:]), len(body),
 	)
 	if _, err := io.WriteString(connection, headers); err != nil {
-		connection.Close()
 		t.Fatal(err)
 	}
 	if _, err := connection.Write(body); err != nil {
-		connection.Close()
 		t.Fatal(err)
 	}
 	select {
 	case <-gateway.gate.accepted:
 	case <-time.After(time.Second):
-		connection.Close()
 		t.Fatal("durable acceptance did not complete")
 	}
+	gateway.gate.Release()
+	if gateway.writeGate == nil {
+		t.Fatal("lost-response upload requires a response-write gate")
+	}
+	gateway.writeGate.WaitForAttempt(t)
 	if err := connection.SetLinger(0); err != nil {
-		connection.Close()
 		t.Fatal(err)
 	}
 	if err := connection.Close(); err != nil {
 		t.Fatal(err)
 	}
-	gateway.gate.Release()
+	gateway.writeGate.Release()
 }
 
 func (g *continuityGateway) WaitForResponseWriteFailure(t *testing.T) {
@@ -382,8 +437,12 @@ func (s *acceptGateStore) Accept(ctx context.Context, envelope inbox.Envelope) (
 		return result, err
 	}
 	s.acceptedOnce.Do(func() { close(s.accepted) })
-	<-s.release
-	return result, nil
+	select {
+	case <-s.release:
+		return result, nil
+	case <-ctx.Done():
+		return result, ctx.Err()
+	}
 }
 
 func (s *acceptGateStore) Release() {
@@ -393,6 +452,7 @@ func (s *acceptGateStore) Release() {
 type responseObservingListener struct {
 	net.Listener
 	writeErrors chan<- error
+	writeGate   *responseWriteGate
 }
 
 func (l *responseObservingListener) Accept() (net.Conn, error) {
@@ -400,23 +460,73 @@ func (l *responseObservingListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &responseObservingConn{Conn: connection, writeErrors: l.writeErrors}, nil
+	return &responseObservingConn{Conn: connection, writeErrors: l.writeErrors, writeGate: l.writeGate}, nil
 }
 
 type responseObservingConn struct {
 	net.Conn
 	writeErrors chan<- error
+	writeGate   *responseWriteGate
 }
 
 func (c *responseObservingConn) Write(body []byte) (int, error) {
-	written, err := c.Conn.Write(body)
-	if err != nil {
-		select {
-		case c.writeErrors <- err:
-		default:
+	if c.writeGate != nil {
+		c.writeGate.Wait()
+		if err := c.observePeerClosure(); err != nil {
+			c.recordWriteError(err)
+			return 0, err
 		}
 	}
+	written, err := c.Conn.Write(body)
+	if err != nil {
+		c.recordWriteError(err)
+	}
 	return written, err
+}
+
+func (c *responseObservingConn) observePeerClosure() error {
+	if err := c.Conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+	defer c.Conn.SetReadDeadline(time.Time{})
+	_, err := c.Conn.Read(make([]byte, 1))
+	return err
+}
+
+func (c *responseObservingConn) recordWriteError(err error) {
+	select {
+	case c.writeErrors <- err:
+	default:
+	}
+}
+
+type responseWriteGate struct {
+	attempted     chan struct{}
+	release       chan struct{}
+	attemptedOnce sync.Once
+	releaseOnce   sync.Once
+}
+
+func newResponseWriteGate() *responseWriteGate {
+	return &responseWriteGate{attempted: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *responseWriteGate) Wait() {
+	g.attemptedOnce.Do(func() { close(g.attempted) })
+	<-g.release
+}
+
+func (g *responseWriteGate) WaitForAttempt(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.attempted:
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not begin writing the abandoned response")
+	}
+}
+
+func (g *responseWriteGate) Release() {
+	g.releaseOnce.Do(func() { close(g.release) })
 }
 
 func eventuallyContinuity(t *testing.T, timeout time.Duration, condition func() bool) bool {
