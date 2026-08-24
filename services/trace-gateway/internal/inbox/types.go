@@ -75,6 +75,7 @@ type Options struct {
 type Store interface {
 	Accept(context.Context, Envelope) (AcceptResult, error)
 	PeekEligible(context.Context, time.Time) (*Batch, error)
+	NextRetryAt(context.Context) (time.Time, error)
 	MarkRetry(context.Context, string, string, Retry) error
 	MarkDelivered(context.Context, string, string, time.Time) error
 	MarkQuarantined(context.Context, string, string, string, time.Time) error

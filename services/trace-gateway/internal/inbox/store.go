@@ -232,6 +232,39 @@ func (s *BoltStore) PeekEligible(ctx context.Context, now time.Time) (*Batch, er
 	return result, err
 }
 
+// NextRetryAt returns the persisted retry time of the FIFO head. A zero value
+// means that the inbox is empty or that its head does not have a retry delay.
+// It deliberately examines only the head so delivery scheduling cannot bypass
+// strict FIFO ordering.
+func (s *BoltStore) NextRetryAt(ctx context.Context) (time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.closed {
+		return time.Time{}, ErrClosed
+	}
+	var nextRetry time.Time
+	err := s.db.View(func(tx *bolt.Tx) error {
+		_, batchKey := tx.Bucket(fifoBucket).Cursor().First()
+		if batchKey == nil {
+			return nil
+		}
+		encoded := tx.Bucket(batchesBucket).Get(batchKey)
+		if encoded == nil {
+			return errors.New("trace inbox FIFO references a missing batch")
+		}
+		batch, err := decodeBatch(encoded)
+		if err != nil {
+			return err
+		}
+		nextRetry = batch.NextRetry
+		return nil
+	})
+	return nextRetry, err
+}
+
 func (s *BoltStore) MarkRetry(ctx context.Context, accountID, batchID string, retry Retry) error {
 	if retry.NextRetry.IsZero() {
 		return errors.New("next retry time is required")
