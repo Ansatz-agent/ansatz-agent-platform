@@ -42,7 +42,8 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	}}}
 	principal := auth.Principal{
 		TokenID:        "trusted-token",
-		UserID:         "42",
+		AccountID:      "22222222-2222-4222-8222-222222222222",
+		UserID:         "mutable-display-id",
 		Username:       "yiyuxiao",
 		InstallationID: "11111111-1111-4111-8111-111111111111",
 		Scope:          "trace:write",
@@ -50,14 +51,14 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	}
 	headers := Headers{SessionID: "session-1", Entrypoint: "voice", RunID: "run-1", SchemaVersion: "1"}
 
-	if err := Canonicalize(request, principal, headers, "gateway-request-1"); err != nil {
+	if err := Canonicalize(request, principal, headers, "11111111-1111-4111-8111-111111111111"); err != nil {
 		t.Fatal(err)
 	}
 
 	resource := request.ResourceSpans[0].Resource.Attributes
-	assertSingle(t, resource, "platform.user.id", "42")
-	assertSingle(t, resource, "user.id", "42")
-	assertSingle(t, resource, "langfuse.user.id", "42")
+	assertSingle(t, resource, "platform.user.id", principal.AccountID)
+	assertSingle(t, resource, "user.id", principal.AccountID)
+	assertSingle(t, resource, "langfuse.user.id", principal.AccountID)
 	assertSingle(t, resource, "langfuse.trace.metadata.username", "yiyuxiao")
 	assertSingle(t, resource, "client.installation.id", principal.InstallationID)
 	assertSingle(t, resource, "hermes.session.id", "session-1")
@@ -67,11 +68,11 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 	assertSingle(t, resource, "hermes.entrypoint", "voice")
 	assertSingle(t, resource, "hermes.run.id", "run-1")
 	assertSingle(t, resource, "telemetry.schema.version", "1")
-	assertSingle(t, resource, "trace.gateway.request.id", "gateway-request-1")
+	assertSingle(t, resource, "trace.gateway.batch.id", "11111111-1111-4111-8111-111111111111")
 
 	span := request.ResourceSpans[0].ScopeSpans[0].Spans[0]
-	assertSingle(t, span.Attributes, "user.id", "42")
-	assertSingle(t, span.Attributes, "langfuse.user.id", "42")
+	assertSingle(t, span.Attributes, "user.id", principal.AccountID)
+	assertSingle(t, span.Attributes, "langfuse.user.id", principal.AccountID)
 	assertSingle(t, span.Attributes, "langfuse.trace.metadata.username", "yiyuxiao")
 	assertSingle(t, span.Attributes, "session.id", "session-1")
 	assertSingle(t, span.Attributes, "langfuse.session.id", "session-1")
@@ -89,6 +90,8 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 		"forged-span",
 		"forged-event",
 		"Bearer secret",
+		"mutable-display-id",
+		"gateway-request-1",
 	} {
 		if strings.Contains(all, forged) {
 			t.Fatalf("forged/sensitive value %q survived: %s", forged, all)
@@ -118,7 +121,7 @@ func TestCanonicalizeProjectsRelayUsageIntoLangfuseGeneration(t *testing.T) {
 			},
 		}}}},
 	}}}
-	principal := auth.Principal{UserID: "42", Username: "yiyuxiao", InstallationID: "11111111-1111-4111-8111-111111111111"}
+	principal := auth.Principal{AccountID: "22222222-2222-4222-8222-222222222222", Username: "yiyuxiao", InstallationID: "11111111-1111-4111-8111-111111111111"}
 	headers := Headers{SessionID: "session-1", Entrypoint: "desktop", RunID: "run-1", SchemaVersion: "1"}
 
 	if err := Canonicalize(request, principal, headers, "gateway-request-1"); err != nil {
@@ -171,7 +174,7 @@ func TestCanonicalizeProjectsCompleteRelayConversationIntoLangfuse(t *testing.T)
 			},
 		}}},
 	}}}
-	principal := auth.Principal{UserID: "42", Username: "yiyuxiao", InstallationID: "11111111-1111-4111-8111-111111111111"}
+	principal := auth.Principal{AccountID: "22222222-2222-4222-8222-222222222222", Username: "yiyuxiao", InstallationID: "11111111-1111-4111-8111-111111111111"}
 	headers := Headers{SessionID: "session-1", Entrypoint: "desktop", RunID: "run-1", SchemaVersion: "1"}
 
 	if err := Canonicalize(request, principal, headers, "gateway-request-1"); err != nil {

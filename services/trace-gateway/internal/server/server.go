@@ -1,11 +1,9 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,13 +12,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/auth"
+	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/inbox"
 	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/otlp"
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/protobuf/proto"
@@ -28,11 +26,11 @@ import (
 
 const (
 	defaultMaxBodyBytes = int64(8 * 1024 * 1024)
-	maxUpstreamBytes    = int64(1024 * 1024)
-	cacheLifetime       = 15 * time.Minute
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+var uuidV4Pattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
+var sha256HexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type PrincipalIntrospector interface {
 	Introspect(context.Context, string) (auth.Principal, error)
@@ -43,44 +41,41 @@ type RateLimiter interface {
 }
 
 type Config struct {
-	Introspector      PrincipalIntrospector
+	Introspector PrincipalIntrospector
+	Store        inbox.Store
+	Trigger      func()
+	MaxBodyBytes int64
+	Limiter      RateLimiter
+	Logger       *slog.Logger
+	Now          func() time.Time
+	RequestID    func() string
+
+	// Deprecated lifecycle inputs remain until Task 17 moves main to the
+	// durable inbox/worker assembly. They are deliberately never consumed by
+	// this HTTP admission path.
 	UpstreamURL       string
 	LangfusePublicKey string
 	LangfuseSecretKey string
 	HTTPClient        *http.Client
-	MaxBodyBytes      int64
-	Limiter           RateLimiter
-	Logger            *slog.Logger
-	Now               func() time.Time
-	RequestID         func() string
 }
 
 type Server struct {
-	introspector  PrincipalIntrospector
-	upstreamURL   string
-	upstreamBasic string
-	httpClient    *http.Client
-	maxBodyBytes  int64
-	limiter       RateLimiter
-	logger        *slog.Logger
-	now           func() time.Time
-	requestID     func() string
-	cache         *responseCache
+	introspector PrincipalIntrospector
+	store        inbox.Store
+	trigger      func()
+	maxBodyBytes int64
+	limiter      RateLimiter
+	logger       *slog.Logger
+	now          func() time.Time
+	requestID    func() string
 }
 
 func New(config Config) (*Server, error) {
 	if config.Introspector == nil {
 		return nil, errors.New("introspector is required")
 	}
-	parsed, err := url.Parse(config.UpstreamURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, errors.New("valid upstream URL is required")
-	}
-	if config.LangfusePublicKey == "" || config.LangfuseSecretKey == "" {
-		return nil, errors.New("Langfuse server credentials are required")
-	}
-	if config.HTTPClient == nil {
-		config.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+	if config.Store == nil {
+		return nil, errors.New("inbox store is required")
 	}
 	if config.MaxBodyBytes <= 0 {
 		config.MaxBodyBytes = defaultMaxBodyBytes
@@ -98,16 +93,14 @@ func New(config Config) (*Server, error) {
 		config.RequestID = randomRequestID
 	}
 	return &Server{
-		introspector:  config.Introspector,
-		upstreamURL:   parsed.String(),
-		upstreamBasic: "Basic " + base64.StdEncoding.EncodeToString([]byte(config.LangfusePublicKey+":"+config.LangfuseSecretKey)),
-		httpClient:    config.HTTPClient,
-		maxBodyBytes:  config.MaxBodyBytes,
-		limiter:       config.Limiter,
-		logger:        config.Logger,
-		now:           config.Now,
-		requestID:     config.RequestID,
-		cache:         newResponseCache(4096),
+		introspector: config.Introspector,
+		store:        config.Store,
+		trigger:      config.Trigger,
+		maxBodyBytes: config.MaxBodyBytes,
+		limiter:      config.Limiter,
+		logger:       config.Logger,
+		now:          config.Now,
+		requestID:    config.RequestID,
 	}, nil
 }
 
@@ -132,7 +125,7 @@ func (s *Server) health(w http.ResponseWriter, request *http.Request) {
 func (s *Server) traces(w http.ResponseWriter, request *http.Request) {
 	started := s.now()
 	requestID := s.requestID()
-	status, size := s.serveTrace(w, request, requestID, started)
+	status, size := s.serveTrace(w, request, started)
 	s.logger.Info("trace request",
 		"request_id", requestID,
 		"status", status,
@@ -141,7 +134,7 @@ func (s *Server) traces(w http.ResponseWriter, request *http.Request) {
 	)
 }
 
-func (s *Server) serveTrace(w http.ResponseWriter, request *http.Request, requestID string, now time.Time) (int, int) {
+func (s *Server) serveTrace(w http.ResponseWriter, request *http.Request, now time.Time) (int, int) {
 	if request.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return http.StatusMethodNotAllowed, 0
@@ -165,8 +158,12 @@ func (s *Server) serveTrace(w http.ResponseWriter, request *http.Request, reques
 	}
 	principal, err := s.introspector.Introspect(request.Context(), bearer)
 	if err != nil {
-		if errors.Is(err, auth.ErrInactive) {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
+		if errors.Is(err, auth.ErrExplicitRevocation) {
+			writeError(w, http.StatusForbidden, inactiveErrorCode(err, "session_revoked"))
+			return http.StatusForbidden, 0
+		}
+		if errors.Is(err, auth.ErrRefreshRequired) {
+			writeError(w, http.StatusUnauthorized, inactiveErrorCode(err, "trace_token_refresh_required"))
 			return http.StatusUnauthorized, 0
 		}
 		writeError(w, http.StatusServiceUnavailable, "authentication_unavailable")
@@ -193,21 +190,12 @@ func (s *Server) serveTrace(w http.ResponseWriter, request *http.Request, reques
 		writeError(w, http.StatusBadRequest, "invalid_protobuf")
 		return http.StatusBadRequest, len(body)
 	}
-	if err := otlp.Canonicalize(&export, principal, headers, "idempotency"); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_trace")
-		return http.StatusBadRequest, len(body)
+	digest := sha256.Sum256(body)
+	if hex.EncodeToString(digest[:]) != headers.PayloadSHA256 {
+		writeError(w, http.StatusConflict, "payload_digest_mismatch")
+		return http.StatusConflict, len(body)
 	}
-	digestBody, err := proto.Marshal(&export)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_trace")
-		return http.StatusBadRequest, len(body)
-	}
-	digest := requestDigest(principal.TokenID, digestBody)
-	if cached, found := s.cache.Get(digest, now); found {
-		writeUpstreamResponse(w, cached)
-		return cached.status, len(body)
-	}
-	if err := otlp.Canonicalize(&export, principal, headers, requestID); err != nil {
+	if err := otlp.Canonicalize(&export, principal, headers.Trace, headers.BatchID); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_trace")
 		return http.StatusBadRequest, len(body)
 	}
@@ -216,70 +204,72 @@ func (s *Server) serveTrace(w http.ResponseWriter, request *http.Request, reques
 		writeError(w, http.StatusBadRequest, "invalid_trace")
 		return http.StatusBadRequest, len(body)
 	}
-	upstream, err := s.forward(request.Context(), canonicalBody)
+	result, err := s.store.Accept(request.Context(), inbox.Envelope{
+		AccountID:      principal.AccountID,
+		SessionID:      principal.SessionID,
+		InstallationID: principal.InstallationID,
+		BatchID:        headers.BatchID,
+		PayloadSHA256:  headers.PayloadSHA256,
+		Payload:        canonicalBody,
+		Headers: inbox.TraceHeaders{
+			SessionID: headers.Trace.SessionID, Entrypoint: headers.Trace.Entrypoint,
+			RunID: headers.Trace.RunID, SchemaVersion: headers.Trace.SchemaVersion,
+		},
+	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream_unavailable")
-		return http.StatusBadGateway, len(body)
+		if errors.Is(err, inbox.ErrIdempotencyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_conflict")
+			return http.StatusConflict, len(body)
+		}
+		if errors.Is(err, inbox.ErrStorageUnavailable) {
+			writeError(w, http.StatusInsufficientStorage, "storage_unavailable")
+			return http.StatusInsufficientStorage, len(body)
+		}
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable")
+		return http.StatusServiceUnavailable, len(body)
 	}
-	expiresAt := now.Add(cacheLifetime)
-	if principal.ExpiresAt.Before(expiresAt) {
-		expiresAt = principal.ExpiresAt
+	if result.BatchID != headers.BatchID || (result.Outcome != inbox.ReceiptAccepted && result.Outcome != inbox.ReceiptDuplicate) {
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable")
+		return http.StatusServiceUnavailable, len(body)
 	}
-	upstream.expiresAt = expiresAt
-	s.cache.Put(digest, upstream, now)
-	writeUpstreamResponse(w, upstream)
-	return upstream.status, len(body)
+	if result.Outcome == inbox.ReceiptAccepted && s.trigger != nil {
+		s.trigger()
+	}
+	writeSuccess(w, headers.BatchID, result.Outcome)
+	return http.StatusOK, len(body)
 }
 
-func (s *Server) forward(ctx context.Context, body []byte) (cachedResponse, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.upstreamURL, bytes.NewReader(body))
-	if err != nil {
-		return cachedResponse{}, err
-	}
-	request.Header.Set("Authorization", s.upstreamBasic)
-	request.Header.Set("Content-Type", "application/x-protobuf")
-	request.Header.Set("Accept", "application/x-protobuf")
-	response, err := s.httpClient.Do(request)
-	if err != nil {
-		return cachedResponse{}, err
-	}
-	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxUpstreamBytes+1))
-	if err != nil || int64(len(responseBody)) > maxUpstreamBytes {
-		return cachedResponse{}, errors.New("invalid upstream response")
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return cachedResponse{}, fmt.Errorf("upstream rejected request")
-	}
-	contentType := response.Header.Get("Content-Type")
-	if !validMediaType(contentType) {
-		contentType = "application/x-protobuf"
-	}
-	return cachedResponse{status: response.StatusCode, body: responseBody, contentType: contentType}, nil
+type requestHeaders struct {
+	Trace         otlp.Headers
+	BatchID       string
+	PayloadSHA256 string
 }
 
-func validatedHeaders(header http.Header) (otlp.Headers, bool) {
+func validatedHeaders(header http.Header) (requestHeaders, bool) {
 	sessionID, sessionOK := singleRequiredHeader(header, "X-Hermes-Session-ID")
 	entrypoint, entrypointOK := singleRequiredHeader(header, "X-Trace-Entrypoint")
 	runID, runOK := singleRequiredHeader(header, "X-Trace-Run-ID")
 	schemaVersion, schemaOK := singleRequiredHeader(header, "X-Telemetry-Schema-Version")
-	if !sessionOK || !entrypointOK || !runOK || !schemaOK {
-		return otlp.Headers{}, false
+	batchID, batchOK := singleRequiredHeader(header, "Idempotency-Key")
+	payloadSHA256, digestOK := singleRequiredHeader(header, "X-Trace-Payload-SHA256")
+	if !sessionOK || !entrypointOK || !runOK || !schemaOK || !batchOK || !digestOK {
+		return requestHeaders{}, false
 	}
-	values := otlp.Headers{
+	trace := otlp.Headers{
 		SessionID:     sessionID,
 		Entrypoint:    entrypoint,
 		RunID:         runID,
 		SchemaVersion: schemaVersion,
 	}
-	if !identifierPattern.MatchString(values.SessionID) || !identifierPattern.MatchString(values.RunID) || values.SchemaVersion != "1" {
-		return otlp.Headers{}, false
+	if !identifierPattern.MatchString(trace.SessionID) || !identifierPattern.MatchString(trace.RunID) || trace.SchemaVersion != "1" ||
+		!uuidV4Pattern.MatchString(batchID) || !sha256HexPattern.MatchString(payloadSHA256) {
+		return requestHeaders{}, false
 	}
-	switch values.Entrypoint {
+	switch trace.Entrypoint {
 	case "desktop", "voice", "cli", "dashboard":
-		return values, true
+		return requestHeaders{Trace: trace, BatchID: strings.ToLower(batchID), PayloadSHA256: payloadSHA256}, true
 	default:
-		return otlp.Headers{}, false
+		return requestHeaders{}, false
 	}
 }
 
@@ -328,14 +318,6 @@ func sourceAddress(remoteAddr string) string {
 	return host
 }
 
-func requestDigest(tokenID string, body []byte) string {
-	digest := sha256.New()
-	_, _ = io.WriteString(digest, tokenID)
-	_, _ = digest.Write([]byte{0})
-	_, _ = digest.Write(body)
-	return hex.EncodeToString(digest.Sum(nil))
-}
-
 func randomRequestID() string {
 	buffer := make([]byte, 16)
 	if _, err := rand.Read(buffer); err != nil {
@@ -351,65 +333,26 @@ func writeError(w http.ResponseWriter, status int, code string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
 }
 
-type cachedResponse struct {
-	status      int
-	body        []byte
-	contentType string
-	expiresAt   time.Time
-}
-
-func writeUpstreamResponse(w http.ResponseWriter, response cachedResponse) {
-	w.Header().Set("Content-Type", response.contentType)
+func writeSuccess(w http.ResponseWriter, batchID string, outcome inbox.ReceiptOutcome) {
+	body, err := proto.Marshal(&collectortracepb.ExportTraceServiceResponse{})
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(response.status)
-	_, _ = w.Write(response.body)
+	w.Header().Set("X-Trace-Batch-ID", batchID)
+	w.Header().Set("X-Trace-Receipt", string(outcome))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
-type responseCache struct {
-	mu      sync.Mutex
-	entries map[string]cachedResponse
-	max     int
-}
-
-func newResponseCache(maximum int) *responseCache {
-	return &responseCache{entries: make(map[string]cachedResponse), max: maximum}
-}
-
-func (cache *responseCache) Get(key string, now time.Time) (cachedResponse, bool) {
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	entry, found := cache.entries[key]
-	if !found {
-		return cachedResponse{}, false
+func inactiveErrorCode(err error, fallback string) string {
+	var inactive *auth.InactiveError
+	if errors.As(err, &inactive) && inactive.Code != "" {
+		return inactive.Code
 	}
-	if !entry.expiresAt.After(now) {
-		delete(cache.entries, key)
-		return cachedResponse{}, false
-	}
-	entry.body = append([]byte(nil), entry.body...)
-	return entry, true
-}
-
-func (cache *responseCache) Put(key string, response cachedResponse, now time.Time) {
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	for existingKey, entry := range cache.entries {
-		if !entry.expiresAt.After(now) {
-			delete(cache.entries, existingKey)
-		}
-	}
-	if len(cache.entries) >= cache.max {
-		var oldestKey string
-		var oldest time.Time
-		for existingKey, entry := range cache.entries {
-			if oldestKey == "" || entry.expiresAt.Before(oldest) {
-				oldestKey, oldest = existingKey, entry.expiresAt
-			}
-		}
-		delete(cache.entries, oldestKey)
-	}
-	response.body = append([]byte(nil), response.body...)
-	cache.entries[key] = response
+	return fallback
 }
 
 type windowLimiter struct {

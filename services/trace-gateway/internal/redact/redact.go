@@ -1,7 +1,10 @@
 package redact
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -55,8 +58,7 @@ func sanitizeValue(value *commonpb.AnyValue, depth int) *commonpb.AnyValue {
 	case *commonpb.AnyValue_StringValue:
 		return stringValue(sanitizeString(typed.StringValue, depth))
 	case *commonpb.AnyValue_BytesValue:
-		cloned := append([]byte(nil), typed.BytesValue...)
-		return &commonpb.AnyValue{Value: &commonpb.AnyValue_BytesValue{BytesValue: cloned}}
+		return stringValue(mediaDescriptor("application/octet-stream", typed.BytesValue))
 	case *commonpb.AnyValue_ArrayValue:
 		values := typed.ArrayValue.GetValues()
 		if len(values) > 256 {
@@ -85,6 +87,9 @@ func sanitizeString(value string, depth int) string {
 		return replacement
 	}
 	trimmed := strings.TrimSpace(value)
+	if mediaType, bytes, ok := base64DataURL(trimmed); ok {
+		return mediaDescriptor(mediaType, bytes)
+	}
 	if depth <= 12 && len(trimmed) <= 1024*1024 && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) {
 		var decoded any
 		if json.Unmarshal([]byte(trimmed), &decoded) == nil {
@@ -95,6 +100,43 @@ func sanitizeString(value string, depth int) string {
 		}
 	}
 	return value
+}
+
+func base64DataURL(value string) (string, []byte, bool) {
+	if !strings.HasPrefix(strings.ToLower(value), "data:") {
+		return "", nil, false
+	}
+	comma := strings.IndexByte(value, ',')
+	if comma <= len("data:") {
+		return "", nil, false
+	}
+	metadata := value[len("data:"):comma]
+	parts := strings.Split(metadata, ";")
+	if len(parts) < 2 || !strings.EqualFold(parts[len(parts)-1], "base64") || strings.TrimSpace(parts[0]) == "" {
+		return "", nil, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value[comma+1:])
+	if err != nil {
+		return "", nil, false
+	}
+	return strings.ToLower(strings.TrimSpace(parts[0])), decoded, true
+}
+
+func mediaDescriptor(mediaType string, value []byte) string {
+	digest := sha256.Sum256(value)
+	descriptor := struct {
+		Redacted  bool   `json:"redacted"`
+		MediaType string `json:"media_type"`
+		ByteSize  int    `json:"byte_size"`
+		SHA256    string `json:"sha256"`
+	}{
+		Redacted: true, MediaType: mediaType, ByteSize: len(value), SHA256: fmt.Sprintf("%x", digest),
+	}
+	rendered, err := json.Marshal(descriptor)
+	if err != nil {
+		return replacement
+	}
+	return string(rendered)
 }
 
 func sanitizeJSON(value any, depth int) any {

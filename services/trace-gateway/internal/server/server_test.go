@@ -3,17 +3,18 @@ package server
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"io"
-	"log/slog"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/auth"
+	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/inbox"
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -21,16 +22,21 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const uploadBearer = "valid-upload-token-that-must-not-leak-1234567890"
+const (
+	uploadBearer = "valid-upload-token-that-must-not-leak-1234567890"
+	batchID      = "11111111-1111-4111-8111-111111111111"
+)
 
 type fakeIntrospector struct{ err error }
 
 func (f fakeIntrospector) Introspect(_ context.Context, _ string) (auth.Principal, error) {
 	return auth.Principal{
 		TokenID:        "token-id",
-		UserID:         "42",
+		AccountID:      "22222222-2222-4222-8222-222222222222",
+		SessionID:      "33333333-3333-4333-8333-333333333333",
+		UserID:         "mutable-display-id",
 		Username:       "yiyuxiao",
-		InstallationID: "11111111-1111-4111-8111-111111111111",
+		InstallationID: "44444444-4444-4444-8444-444444444444",
 		ExpiresAt:      time.Now().Add(time.Hour),
 		Scope:          "trace:write",
 		Audience:       "ansatz-trace-gateway",
@@ -41,109 +47,174 @@ type denyLimiter struct{}
 
 func (denyLimiter) Allow(string, string, time.Time) bool { return false }
 
-func TestHandlerForwardsCanonicalProtobufOnceForIdenticalRetry(t *testing.T) {
-	var calls atomic.Int32
-	var upstreamAuthorization string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		upstreamAuthorization = r.Header.Get("Authorization")
-		body, _ := io.ReadAll(r.Body)
-		if strings.Contains(string(body), "forged-user") {
-			t.Fatal("forged identity reached upstream")
-		}
-		w.Header().Set("Content-Type", "application/x-protobuf")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte{0x0a, 0x00})
-	}))
-	defer upstream.Close()
+type recordingStore struct {
+	inbox.Store
+	result inbox.AcceptResult
+	err    error
 
-	var logs bytes.Buffer
-	handler := mustHandler(t, Config{
-		Introspector:      fakeIntrospector{},
-		UpstreamURL:       upstream.URL,
-		LangfusePublicKey: "public-key",
-		LangfuseSecretKey: "server-secret",
-		Logger:            slog.New(slog.NewTextHandler(&logs, nil)),
-		RequestID:         func() string { return "request-id" },
-	})
+	mu        sync.Mutex
+	envelopes []inbox.Envelope
+}
+
+func (s *recordingStore) Accept(_ context.Context, envelope inbox.Envelope) (inbox.AcceptResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.envelopes = append(s.envelopes, envelope)
+	return s.result, s.err
+}
+
+func (s *recordingStore) envelope(t *testing.T) inbox.Envelope {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.envelopes) != 1 {
+		t.Fatalf("accepted envelopes = %d, want 1", len(s.envelopes))
+	}
+	return s.envelopes[0]
+}
+
+type blockingStore struct {
+	inbox.Store
+	accepted chan struct{}
+}
+
+func (s *blockingStore) Accept(_ context.Context, envelope inbox.Envelope) (inbox.AcceptResult, error) {
+	<-s.accepted
+	return inbox.AcceptResult{BatchID: envelope.BatchID, Outcome: inbox.ReceiptAccepted}, nil
+}
+
+func TestHandlerAcknowledgesOnlySyncedInboxOwnership(t *testing.T) {
+	store := &blockingStore{accepted: make(chan struct{})}
+	handler := mustHandler(t, Config{Introspector: fakeIntrospector{}, Store: store})
 	body := validBody(t)
-	for range 2 {
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, validRequest(body))
-		if response.Code != http.StatusOK {
-			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
-		}
-		if response.Header().Get("Content-Type") != "application/x-protobuf" {
-			t.Fatalf("content type = %q", response.Header().Get("Content-Type"))
-		}
+	request := validRequest(body)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { handler.ServeHTTP(response, request); close(done) }()
+	assertNotClosed(t, done)
+	close(store.accepted)
+	<-done
+	assertSuccess(t, response, inbox.ReceiptAccepted)
+}
+
+func TestHandlerStoresCanonicalBatchUnderImmutableAccountIdentity(t *testing.T) {
+	store := &recordingStore{result: inbox.AcceptResult{BatchID: batchID, Outcome: inbox.ReceiptAccepted}}
+	handler := mustHandler(t, Config{Introspector: fakeIntrospector{}, Store: store})
+	body := validBody(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, validRequest(body))
+	assertSuccess(t, response, inbox.ReceiptAccepted)
+
+	envelope := store.envelope(t)
+	if envelope.AccountID != "22222222-2222-4222-8222-222222222222" {
+		t.Fatalf("account ID = %q", envelope.AccountID)
 	}
-	if calls.Load() != 1 {
-		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	if envelope.SessionID != "33333333-3333-4333-8333-333333333333" || envelope.InstallationID != "44444444-4444-4444-8444-444444444444" {
+		t.Fatalf("trusted envelope identity = %+v", envelope)
 	}
-	wantBasic := "Basic " + base64.StdEncoding.EncodeToString([]byte("public-key:server-secret"))
-	if upstreamAuthorization != wantBasic {
-		t.Fatalf("upstream authorization = %q", upstreamAuthorization)
+	if envelope.BatchID != batchID || envelope.PayloadSHA256 != sha256Hex(body) {
+		t.Fatalf("envelope receipt identity = %+v", envelope)
 	}
-	for _, secret := range []string{uploadBearer, "server-secret", "public-key", "forged-user"} {
-		if strings.Contains(logs.String(), secret) {
-			t.Fatalf("secret leaked in logs: %s", logs.String())
-		}
+	var exported collectortracepb.ExportTraceServiceRequest
+	if err := proto.Unmarshal(envelope.Payload, &exported); err != nil {
+		t.Fatal(err)
+	}
+	attributes := exported.ResourceSpans[0].Resource.Attributes
+	assertAttribute(t, attributes, "platform.user.id", envelope.AccountID)
+	assertAttribute(t, attributes, "user.id", envelope.AccountID)
+	assertAttribute(t, attributes, "langfuse.user.id", envelope.AccountID)
+	assertAttribute(t, attributes, "trace.gateway.batch.id", batchID)
+	if got := exported.String(); strings.Contains(got, "mutable-display-id") || strings.Contains(got, "request-id") {
+		t.Fatalf("mutable or request identity reached canonical payload: %s", got)
+	}
+}
+
+func TestHandlerReturnsDuplicateDurableReceipt(t *testing.T) {
+	store := &recordingStore{result: inbox.AcceptResult{BatchID: batchID, Outcome: inbox.ReceiptDuplicate}}
+	handler := mustHandler(t, Config{Introspector: fakeIntrospector{}, Store: store})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, validRequest(validBody(t)))
+	assertSuccess(t, response, inbox.ReceiptDuplicate)
+}
+
+func TestHandlerTriggersWorkerOnlyAfterAcceptedInboxBatch(t *testing.T) {
+	store := &recordingStore{result: inbox.AcceptResult{BatchID: batchID, Outcome: inbox.ReceiptAccepted}}
+	triggered := make(chan struct{}, 1)
+	handler := mustHandler(t, Config{
+		Introspector: fakeIntrospector{},
+		Store:        store,
+		Trigger:      func() { triggered <- struct{}{} },
+	})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, validRequest(validBody(t)))
+	assertSuccess(t, response, inbox.ReceiptAccepted)
+	select {
+	case <-triggered:
+	case <-time.After(time.Second):
+		t.Fatal("accepted batch did not trigger the delivery worker")
 	}
 }
 
 func TestHandlerRejectsInvalidContractsWithFixedNoStoreErrors(t *testing.T) {
-	unavailableUpstream := "http://127.0.0.1:1"
 	tests := []struct {
 		name    string
 		config  Config
 		request func(*testing.T) *http.Request
 		status  int
+		code    string
 	}{
-		{"bad headers", Config{Introspector: fakeIntrospector{}, UpstreamURL: unavailableUpstream}, func(t *testing.T) *http.Request {
+		{"missing idempotency key", Config{Introspector: fakeIntrospector{}, Store: acceptedStore()}, func(t *testing.T) *http.Request {
 			r := validRequest(validBody(t))
-			r.Header.Del("X-Hermes-Session-ID")
+			r.Header.Del("Idempotency-Key")
 			return r
-		}, 400},
-		{"inactive", Config{Introspector: fakeIntrospector{err: auth.ErrInactive}, UpstreamURL: unavailableUpstream}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 401},
-		{"duplicate authorization", Config{Introspector: fakeIntrospector{}, UpstreamURL: unavailableUpstream}, func(t *testing.T) *http.Request {
+		}, 400, "invalid_headers"},
+		{"duplicate idempotency key", Config{Introspector: fakeIntrospector{}, Store: acceptedStore()}, func(t *testing.T) *http.Request {
 			r := validRequest(validBody(t))
-			r.Header.Add("Authorization", "Bearer "+uploadBearer)
+			r.Header.Add("Idempotency-Key", batchID)
 			return r
-		}, 401},
-		{"duplicate identity header", Config{Introspector: fakeIntrospector{}, UpstreamURL: unavailableUpstream}, func(t *testing.T) *http.Request {
+		}, 400, "invalid_headers"},
+		{"invalid idempotency key", Config{Introspector: fakeIntrospector{}, Store: acceptedStore()}, func(t *testing.T) *http.Request {
 			r := validRequest(validBody(t))
-			r.Header.Add("X-Hermes-Session-ID", "session-2")
+			r.Header.Set("Idempotency-Key", "not-a-v4-uuid")
 			return r
-		}, 400},
-		{"wrong type", Config{Introspector: fakeIntrospector{}, UpstreamURL: unavailableUpstream}, func(t *testing.T) *http.Request {
+		}, 400, "invalid_headers"},
+		{"uppercase payload digest", Config{Introspector: fakeIntrospector{}, Store: acceptedStore()}, func(t *testing.T) *http.Request {
+			body := validBody(t)
+			r := validRequest(body)
+			r.Header.Set("X-Trace-Payload-SHA256", strings.ToUpper(sha256Hex(body)))
+			return r
+		}, 400, "invalid_headers"},
+		{"digest mismatch", Config{Introspector: fakeIntrospector{}, Store: acceptedStore()}, func(t *testing.T) *http.Request {
 			r := validRequest(validBody(t))
-			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("X-Trace-Payload-SHA256", strings.Repeat("0", 64))
 			return r
-		}, 415},
-		{"compressed", Config{Introspector: fakeIntrospector{}, UpstreamURL: unavailableUpstream}, func(t *testing.T) *http.Request {
-			r := validRequest(validBody(t))
-			r.Header.Set("Content-Encoding", "gzip")
-			return r
-		}, 415},
-		{"too large", Config{Introspector: fakeIntrospector{}, UpstreamURL: unavailableUpstream, MaxBodyBytes: 32}, func(t *testing.T) *http.Request {
-			return validRequest(bytes.Repeat([]byte("x"), 33))
-		}, 413},
-		{"rate limited", Config{Introspector: fakeIntrospector{}, UpstreamURL: unavailableUpstream, Limiter: denyLimiter{}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 429},
-		{"auth unavailable", Config{Introspector: fakeIntrospector{err: auth.ErrUnavailable}, UpstreamURL: unavailableUpstream}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 503},
-		{"upstream unavailable", Config{Introspector: fakeIntrospector{}, UpstreamURL: unavailableUpstream}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 502},
+		}, 409, "payload_digest_mismatch"},
+		{"idempotency conflict", Config{Introspector: fakeIntrospector{}, Store: &recordingStore{err: inbox.ErrIdempotencyConflict}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 409, "idempotency_conflict"},
+		{"storage unavailable", Config{Introspector: fakeIntrospector{}, Store: &recordingStore{err: inbox.ErrStorageUnavailable}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 507, "storage_unavailable"},
+		{"refresh required", Config{Introspector: fakeIntrospector{err: &auth.InactiveError{Code: "trace_token_refresh_required"}}, Store: acceptedStore()}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 401, "trace_token_refresh_required"},
+		{"explicit revocation", Config{Introspector: fakeIntrospector{err: &auth.InactiveError{Code: "session_revoked", Explicit: true}}, Store: acceptedStore()}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 403, "session_revoked"},
+		{"auth unavailable", Config{Introspector: fakeIntrospector{err: auth.ErrUnavailable}, Store: acceptedStore()}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 503, "authentication_unavailable"},
+		{"too large", Config{Introspector: fakeIntrospector{}, Store: acceptedStore(), MaxBodyBytes: 32}, func(t *testing.T) *http.Request { return validRequest(bytes.Repeat([]byte("x"), 33)) }, 413, "payload_too_large"},
+		{"rate limited", Config{Introspector: fakeIntrospector{}, Store: acceptedStore(), Limiter: denyLimiter{}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 429, "rate_limited"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			handler := mustHandler(t, test.config)
 			response := httptest.NewRecorder()
-			handler.ServeHTTP(response, test.request(t))
+			mustHandler(t, test.config).ServeHTTP(response, test.request(t))
 			if response.Code != test.status {
 				t.Fatalf("status = %d, want %d; body=%s", response.Code, test.status, response.Body.String())
 			}
 			if response.Header().Get("Cache-Control") != "no-store" {
 				t.Fatalf("Cache-Control = %q", response.Header().Get("Cache-Control"))
 			}
-			if strings.Contains(response.Body.String(), uploadBearer) {
+			var body map[string]string
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["error"] != test.code {
+				t.Fatalf("error = %q, want %q", body["error"], test.code)
+			}
+			if bytes.Contains(response.Body.Bytes(), []byte(uploadBearer)) {
 				t.Fatal("bearer leaked in error")
 			}
 		})
@@ -151,7 +222,7 @@ func TestHandlerRejectsInvalidContractsWithFixedNoStoreErrors(t *testing.T) {
 }
 
 func TestHandlerExposesOnlyHealthAndTraceRoutes(t *testing.T) {
-	handler := mustHandler(t, Config{Introspector: fakeIntrospector{}, UpstreamURL: "http://127.0.0.1:1"})
+	handler := mustHandler(t, Config{Introspector: fakeIntrospector{}, Store: acceptedStore()})
 	for path, status := range map[string]int{"/healthz": 200, "/": 404, "/metrics": 404, "/v1/logs": 404} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
@@ -161,14 +232,12 @@ func TestHandlerExposesOnlyHealthAndTraceRoutes(t *testing.T) {
 	}
 }
 
+func acceptedStore() *recordingStore {
+	return &recordingStore{result: inbox.AcceptResult{BatchID: batchID, Outcome: inbox.ReceiptAccepted}}
+}
+
 func mustHandler(t *testing.T, config Config) http.Handler {
 	t.Helper()
-	if config.LangfusePublicKey == "" {
-		config.LangfusePublicKey = "public"
-	}
-	if config.LangfuseSecretKey == "" {
-		config.LangfuseSecretKey = "secret"
-	}
 	gateway, err := New(config)
 	if err != nil {
 		t.Fatal(err)
@@ -186,38 +255,70 @@ func validRequest(body []byte) *http.Request {
 	r.Header.Set("X-Trace-Entrypoint", "desktop")
 	r.Header.Set("X-Trace-Run-ID", "run-1")
 	r.Header.Set("X-Telemetry-Schema-Version", "1")
+	r.Header.Set("Idempotency-Key", batchID)
+	r.Header.Set("X-Trace-Payload-SHA256", sha256Hex(body))
 	return r
 }
 
 func validBody(t *testing.T) []byte {
 	t.Helper()
-	request := &collectortracepb.ExportTraceServiceRequest{
-		ResourceSpans: []*tracepb.ResourceSpans{
-			{
-				Resource: &resourcepb.Resource{},
-				ScopeSpans: []*tracepb.ScopeSpans{
-					{
-						Spans: []*tracepb.Span{
-							{
-								TraceId: bytes.Repeat([]byte{1}, 16),
-								SpanId:  bytes.Repeat([]byte{2}, 8),
-								Name:    "agent turn",
-								Attributes: []*commonpb.KeyValue{
-									{
-										Key:   "platform.user.id",
-										Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "forged-user"}},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
+	request := &collectortracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		Resource: &resourcepb.Resource{},
+		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{{
+			TraceId: bytes.Repeat([]byte{1}, 16), SpanId: bytes.Repeat([]byte{2}, 8), Name: "agent turn",
+			Attributes: []*commonpb.KeyValue{{Key: "platform.user.id", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "forged-user"}}}},
+		}}}},
+	}}}
 	body, err := proto.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return body
+}
+
+func assertSuccess(t *testing.T, response *httptest.ResponseRecorder, receipt inbox.ReceiptOutcome) {
+	t.Helper()
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("X-Trace-Batch-ID") != batchID {
+		t.Fatalf("batch ID = %q", response.Header().Get("X-Trace-Batch-ID"))
+	}
+	if response.Header().Get("X-Trace-Receipt") != string(receipt) {
+		t.Fatalf("receipt = %q", response.Header().Get("X-Trace-Receipt"))
+	}
+	if response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Content-Type") != "application/x-protobuf" {
+		t.Fatalf("success headers = %v", response.Header())
+	}
+	var body collectortracepb.ExportTraceServiceResponse
+	if err := proto.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("OTLP success body: %v", err)
+	}
+}
+
+func assertNotClosed(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+		t.Fatal("handler replied before the inbox accepted the batch")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func assertAttribute(t *testing.T, attributes []*commonpb.KeyValue, key, want string) {
+	t.Helper()
+	for _, attribute := range attributes {
+		if attribute.Key == key {
+			if got := attribute.Value.GetStringValue(); got != want {
+				t.Fatalf("%s = %q, want %q", key, got, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("%s missing", key)
+}
+
+func sha256Hex(body []byte) string {
+	digest := sha256.Sum256(body)
+	return hex.EncodeToString(digest[:])
 }
