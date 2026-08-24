@@ -71,13 +71,13 @@ func main() {
 func loadRuntimeConfig(getenv func(string) string) (runtimeConfig, error) {
 	config := runtimeConfig{listenAddress: environmentFrom(getenv, "TRACE_GATEWAY_LISTEN_ADDR", ":8080")}
 	var err error
-	if config.introspectionURL, err = requiredFrom(getenv, "AUTH_INTROSPECTION_URL"); err != nil {
+	if config.introspectionURL, err = requiredServiceURLFrom(getenv, "AUTH_INTROSPECTION_URL"); err != nil {
 		return runtimeConfig{}, err
 	}
 	if config.internalSecret, err = requiredFrom(getenv, "TRACE_GATEWAY_INTERNAL_SECRET"); err != nil {
 		return runtimeConfig{}, err
 	}
-	if config.upstreamURL, err = requiredURLFrom(getenv, "LANGFUSE_OTLP_TRACES_URL"); err != nil {
+	if config.upstreamURL, err = requiredServiceURLFrom(getenv, "LANGFUSE_OTLP_TRACES_URL"); err != nil {
 		return runtimeConfig{}, err
 	}
 	if config.publicKey, err = requiredFrom(getenv, "LANGFUSE_PUBLIC_KEY"); err != nil {
@@ -215,14 +215,23 @@ func requiredFrom(getenv func(string) string, name string) (string, error) {
 	return value, nil
 }
 
-func requiredURLFrom(getenv func(string) string, name string) (string, error) {
+func requiredServiceURLFrom(getenv func(string) string, name string) (string, error) {
 	value, err := requiredFrom(getenv, name)
 	if err != nil {
 		return "", err
 	}
 	parsed, err := url.ParseRequestURI(value)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("environment variable is not a valid URL: %s", name)
+	if strings.Contains(value, "#") || err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("invalid URL for environment variable: %s", name)
+	}
+	if port := parsed.Port(); port != "" {
+		parsedPort, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || parsedPort == 0 {
+			return "", fmt.Errorf("invalid URL for environment variable: %s", name)
+		}
+	}
+	if parsed.Path == "" {
+		parsed.Path = "/"
 	}
 	return parsed.String(), nil
 }

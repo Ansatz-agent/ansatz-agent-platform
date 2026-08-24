@@ -77,6 +77,67 @@ func TestLoadRuntimeConfigUsesExactBoundedInboxValues(t *testing.T) {
 	}
 }
 
+func TestLoadRuntimeConfigAcceptsOnlySafeAbsoluteServiceEndpointURLs(t *testing.T) {
+	const secret = "secret-url-value-that-must-not-appear"
+	tests := []struct {
+		name     string
+		variable string
+		value    string
+		want     string
+	}{
+		{"accepts HTTPS introspection endpoint", "AUTH_INTROSPECTION_URL", "https://auth.example.test/internal/trace-token/introspect/", ""},
+		{"accepts HTTP upstream endpoint", "LANGFUSE_OTLP_TRACES_URL", "http://langfuse.example.test/langfuse/api/public/otel/v1/traces", ""},
+		{"rejects malformed introspection endpoint", "AUTH_INTROSPECTION_URL", "https://%", "invalid URL"},
+		{"rejects relative introspection endpoint", "AUTH_INTROSPECTION_URL", "/internal/trace-token/introspect/", "invalid URL"},
+		{"rejects introspection endpoint without host", "AUTH_INTROSPECTION_URL", "https:/internal/trace-token/introspect/", "invalid URL"},
+		{"rejects introspection endpoint with invalid port", "AUTH_INTROSPECTION_URL", "https://auth.example.test:not-a-port/internal/", "invalid URL"},
+		{"rejects introspection endpoint with out of range port", "AUTH_INTROSPECTION_URL", "https://auth.example.test:65536/internal/", "invalid URL"},
+		{"rejects introspection credentials", "AUTH_INTROSPECTION_URL", "https://user:password@auth.example.test/internal/", "invalid URL"},
+		{"rejects introspection query", "AUTH_INTROSPECTION_URL", "https://auth.example.test/internal/?token=secret", "invalid URL"},
+		{"rejects introspection fragment", "AUTH_INTROSPECTION_URL", "https://auth.example.test/internal/#secret", "invalid URL"},
+		{"rejects introspection FTP", "AUTH_INTROSPECTION_URL", "ftp://auth.example.test/internal/", "invalid URL"},
+		{"rejects upstream credentials", "LANGFUSE_OTLP_TRACES_URL", "https://user:password@langfuse.example.test/v1/traces", "invalid URL"},
+		{"rejects upstream query", "LANGFUSE_OTLP_TRACES_URL", "https://langfuse.example.test/v1/traces?key=secret", "invalid URL"},
+		{"rejects upstream fragment", "LANGFUSE_OTLP_TRACES_URL", "https://langfuse.example.test/v1/traces#secret", "invalid URL"},
+		{"rejects upstream non-HTTP scheme", "LANGFUSE_OTLP_TRACES_URL", "file:///private/trace", "invalid URL"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := validGatewayEnvironment(secret)
+			values[test.variable] = test.value
+			config, err := loadRuntimeConfig(func(name string) string { return values[name] })
+			if test.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if config.introspectionURL != values["AUTH_INTROSPECTION_URL"] || config.upstreamURL != values["LANGFUSE_OTLP_TRACES_URL"] {
+					t.Fatalf("endpoint URLs changed: introspection=%q upstream=%q", config.introspectionURL, config.upstreamURL)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.variable) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %s %s", err, test.variable, test.want)
+			}
+			if strings.Contains(err.Error(), test.value) || strings.Contains(err.Error(), secret) {
+				t.Fatalf("configuration error leaked endpoint material: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRuntimeConfigNormalizesOnlyAnEmptyEndpointPathToRootSlash(t *testing.T) {
+	values := validGatewayEnvironment("test-only-secret")
+	values["AUTH_INTROSPECTION_URL"] = "https://auth.example.test"
+	values["LANGFUSE_OTLP_TRACES_URL"] = "http://langfuse.example.test"
+	config, err := loadRuntimeConfig(func(name string) string { return values[name] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.introspectionURL != "https://auth.example.test/" || config.upstreamURL != "http://langfuse.example.test/" {
+		t.Fatalf("normalized URLs = introspection=%q upstream=%q", config.introspectionURL, config.upstreamURL)
+	}
+}
+
 func TestShutdownGatewayStopsAdmissionBeforeWorkerAndInbox(t *testing.T) {
 	var events []string
 	var mu sync.Mutex

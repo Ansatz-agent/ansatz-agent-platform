@@ -50,9 +50,6 @@ type Config struct {
 	Now          func() time.Time
 	RequestID    func() string
 
-	// Deprecated lifecycle inputs remain until Task 17 moves main to the
-	// durable inbox/worker assembly. They are deliberately never consumed by
-	// this HTTP admission path.
 	UpstreamURL       string
 	LangfusePublicKey string
 	LangfuseSecretKey string
