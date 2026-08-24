@@ -3,6 +3,7 @@ module github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway
 go 1.24.0
 
 require (
+	go.etcd.io/bbolt v1.4.3
 	go.opentelemetry.io/proto/otlp v1.7.1
 	google.golang.org/protobuf v1.36.8
 )
