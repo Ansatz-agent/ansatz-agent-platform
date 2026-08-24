@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -29,13 +32,13 @@ const continuityBearerTwo = "second-upload-token-that-is-never-a-receipt-12345"
 
 func TestLostClientResponseAndGatewayRestartKeepOneLogicalBatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inbox.db")
-	upstream := &continuityUpstream{}
-	first := newContinuityGateway(t, path, upstream, "first-token-id")
+	upstream := newContinuityUpstream()
+	first := newGatedContinuityGateway(t, path, upstream, "first-token-id")
 
-	firstResponse := postContinuityTrace(t, first.http.URL, continuityBearerOne, validBody(t))
-	discardResponse(t, firstResponse)
-	if !eventuallyContinuity(t, time.Second, func() bool { return upstream.Attempts() >= 1 }) {
-		t.Fatal("first gateway worker did not attempt durable delivery")
+	sendAndAbandonAfterDurableAccept(t, first, continuityBearerOne, validBody(t))
+	first.WaitForResponseWriteFailure(t)
+	if !eventuallyContinuity(t, time.Second, upstream.UnhealthyAttemptStarted) {
+		t.Fatal("first gateway worker did not begin its controlled unavailable attempt")
 	}
 	first.Close(t)
 
@@ -65,26 +68,43 @@ func TestLostClientResponseAndGatewayRestartKeepOneLogicalBatch(t *testing.T) {
 	if !eventuallyContinuity(t, time.Second, func() bool { return upstream.Successes() == 1 }) {
 		t.Fatalf("successful upstream deliveries = %d", upstream.Successes())
 	}
+	second.StopWorker(t)
 	if got := second.ReceiptCount(t); got != 1 {
 		t.Fatalf("stored receipts = %d", got)
 	}
 	if got := upstream.LogicalIdentities(); len(got) != 1 {
 		t.Fatalf("logical upstream identities = %v", got)
 	}
+	if calls, successes, postSuccessCalls, violation := upstream.Snapshot(); calls != 2 || successes != 1 || postSuccessCalls != 0 || violation != nil {
+		t.Fatalf("upstream calls=%d successes=%d post_success_calls=%d violation=%v", calls, successes, postSuccessCalls, violation)
+	}
 }
 
 type continuityGateway struct {
-	store      *inbox.BoltStore
-	http       *httptest.Server
-	cancel     context.CancelFunc
-	workerDone <-chan error
+	store         *inbox.BoltStore
+	http          *httptest.Server
+	cancel        context.CancelFunc
+	workerDone    <-chan error
+	workerStopped bool
+	gate          *acceptGateStore
+	writeErrors   <-chan error
 }
 
 func newContinuityGateway(t *testing.T, path string, upstream *continuityUpstream, tokenID string) *continuityGateway {
+	return newContinuityGatewayWithAdmissionGate(t, path, upstream, tokenID, false)
+}
+
+func newContinuityGatewayWithAdmissionGate(t *testing.T, path string, upstream *continuityUpstream, tokenID string, gated bool) *continuityGateway {
 	t.Helper()
 	store, err := inbox.Open(path, inbox.Options{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	var admission inbox.Store = store
+	var gate *acceptGateStore
+	if gated {
+		gate = newAcceptGateStore(store)
+		admission = gate
 	}
 	worker := delivery.New(store, upstream, delivery.Options{
 		BaseRetry: 5 * time.Millisecond,
@@ -93,7 +113,7 @@ func newContinuityGateway(t *testing.T, path string, upstream *continuityUpstrea
 	})
 	gateway, err := New(Config{
 		Introspector: continuityIntrospector{tokenID: tokenID},
-		Store:        store,
+		Store:        admission,
 		Trigger:      worker.Trigger,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -104,20 +124,44 @@ func newContinuityGateway(t *testing.T, path string, upstream *continuityUpstrea
 	workerCtx, cancel := context.WithCancel(context.Background())
 	workerDone := make(chan error, 1)
 	go func() { workerDone <- worker.Run(workerCtx) }()
-	return &continuityGateway{
-		store: store, http: httptest.NewServer(gateway.Handler()), cancel: cancel, workerDone: workerDone,
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		cancel()
+		<-workerDone
+		_ = store.Close()
+		t.Fatal(err)
 	}
+	writeErrors := make(chan error, 1)
+	httpServer := httptest.NewUnstartedServer(gateway.Handler())
+	httpServer.Listener = &responseObservingListener{Listener: listener, writeErrors: writeErrors}
+	httpServer.Start()
+	return &continuityGateway{
+		store: store, http: httpServer, cancel: cancel, workerDone: workerDone, gate: gate, writeErrors: writeErrors,
+	}
+}
+
+func newGatedContinuityGateway(t *testing.T, path string, upstream *continuityUpstream, tokenID string) *continuityGateway {
+	return newContinuityGatewayWithAdmissionGate(t, path, upstream, tokenID, true)
 }
 
 func (g *continuityGateway) Close(t *testing.T) {
 	t.Helper()
 	g.http.Close()
+	g.StopWorker(t)
+	if err := g.store.Close(); err != nil {
+		t.Errorf("store close: %v", err)
+	}
+}
+
+func (g *continuityGateway) StopWorker(t *testing.T) {
+	t.Helper()
+	if g.workerStopped {
+		return
+	}
+	g.workerStopped = true
 	g.cancel()
 	if err := <-g.workerDone; err != nil {
 		t.Errorf("worker shutdown: %v", err)
-	}
-	if err := g.store.Close(); err != nil {
-		t.Errorf("store close: %v", err)
 	}
 }
 
@@ -151,21 +195,35 @@ func (i continuityIntrospector) Introspect(_ context.Context, bearer string) (au
 }
 
 type continuityUpstream struct {
-	mu         sync.Mutex
-	healthy    bool
-	attempts   int
-	successes  int
-	identities map[string]struct{}
+	mu                     sync.Mutex
+	healthy                bool
+	calls                  int
+	successes              int
+	postSuccessCalls       int
+	healthySuccessObserved bool
+	violation              error
+	identities             map[string]struct{}
+	unhealthyAttempt       chan struct{}
+	unhealthyOnce          sync.Once
 }
 
-func (u *continuityUpstream) Send(_ context.Context, payload []byte) (delivery.Response, error) {
+func newContinuityUpstream() *continuityUpstream {
+	return &continuityUpstream{unhealthyAttempt: make(chan struct{})}
+}
+
+func (u *continuityUpstream) Send(ctx context.Context, payload []byte) (delivery.Response, error) {
 	identity, err := traceSpanIdentity(payload)
 	if err != nil {
 		return delivery.Response{Status: http.StatusBadRequest}, err
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.attempts++
+	u.calls++
+	if u.healthySuccessObserved {
+		u.postSuccessCalls++
+		u.violation = errors.New("upstream invoked after first healthy success")
+		return delivery.Response{Status: http.StatusConflict}, u.violation
+	}
 	if u.identities == nil {
 		u.identities = make(map[string]struct{})
 	}
@@ -176,8 +234,13 @@ func (u *continuityUpstream) Send(_ context.Context, payload []byte) (delivery.R
 	}
 	u.identities[identity] = struct{}{}
 	if !u.healthy {
-		return delivery.Response{Status: http.StatusServiceUnavailable}, nil
+		u.unhealthyOnce.Do(func() { close(u.unhealthyAttempt) })
+		u.mu.Unlock()
+		<-ctx.Done()
+		u.mu.Lock()
+		return delivery.Response{}, ctx.Err()
 	}
+	u.healthySuccessObserved = true
 	u.successes++
 	return delivery.Response{Status: http.StatusOK}, nil
 }
@@ -188,10 +251,13 @@ func (u *continuityUpstream) SetHealthy(healthy bool) {
 	u.healthy = healthy
 }
 
-func (u *continuityUpstream) Attempts() int {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.attempts
+func (u *continuityUpstream) UnhealthyAttemptStarted() bool {
+	select {
+	case <-u.unhealthyAttempt:
+		return true
+	default:
+		return false
+	}
 }
 
 func (u *continuityUpstream) Successes() int {
@@ -209,6 +275,12 @@ func (u *continuityUpstream) LogicalIdentities() []string {
 	}
 	sort.Strings(identities)
 	return identities
+}
+
+func (u *continuityUpstream) Snapshot() (calls, successes, postSuccessCalls int, violation error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls, u.successes, u.postSuccessCalls, u.violation
 }
 
 func postContinuityTrace(t *testing.T, baseURL, bearer string, body []byte) *http.Response {
@@ -234,19 +306,117 @@ func postContinuityTrace(t *testing.T, baseURL, bearer string, body []byte) *htt
 	return response
 }
 
-func discardResponse(t *testing.T, response *http.Response) {
+func sendAndAbandonAfterDurableAccept(t *testing.T, gateway *continuityGateway, bearer string, body []byte) {
 	t.Helper()
-	body, err := io.ReadAll(response.Body)
+	if gateway.gate == nil {
+		t.Fatal("lost-response upload requires an admission gate")
+	}
+	parsed, err := url.Parse(gateway.http.URL)
 	if err != nil {
-		response.Body.Close()
 		t.Fatal(err)
 	}
-	if err := response.Body.Close(); err != nil {
+	address, err := net.ResolveTCPAddr("tcp", parsed.Host)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("first upload status = %d; body=%s", response.StatusCode, body)
+	connection, err := net.DialTCP("tcp", nil, address)
+	if err != nil {
+		t.Fatal(err)
 	}
+	digest := sha256.Sum256(body)
+	headers := fmt.Sprintf(
+		"POST /v1/traces HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nContent-Type: application/x-protobuf\r\nContent-Encoding: identity\r\nX-Hermes-Session-ID: continuity-session\r\nX-Trace-Entrypoint: desktop\r\nX-Trace-Run-ID: continuity-run\r\nX-Telemetry-Schema-Version: 1\r\nIdempotency-Key: %s\r\nX-Trace-Payload-SHA256: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+		parsed.Host, bearer, batchID, hex.EncodeToString(digest[:]), len(body),
+	)
+	if _, err := io.WriteString(connection, headers); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	if _, err := connection.Write(body); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	select {
+	case <-gateway.gate.accepted:
+	case <-time.After(time.Second):
+		connection.Close()
+		t.Fatal("durable acceptance did not complete")
+	}
+	if err := connection.SetLinger(0); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gateway.gate.Release()
+}
+
+func (g *continuityGateway) WaitForResponseWriteFailure(t *testing.T) {
+	t.Helper()
+	select {
+	case err := <-g.writeErrors:
+		if err == nil {
+			t.Fatal("response write unexpectedly succeeded after client reset")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not observe the abandoned client connection")
+	}
+}
+
+type acceptGateStore struct {
+	inbox.Store
+	accepted     chan struct{}
+	release      chan struct{}
+	acceptedOnce sync.Once
+	releaseOnce  sync.Once
+}
+
+func newAcceptGateStore(store inbox.Store) *acceptGateStore {
+	return &acceptGateStore{Store: store, accepted: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (s *acceptGateStore) Accept(ctx context.Context, envelope inbox.Envelope) (inbox.AcceptResult, error) {
+	result, err := s.Store.Accept(ctx, envelope)
+	if err != nil {
+		return result, err
+	}
+	s.acceptedOnce.Do(func() { close(s.accepted) })
+	<-s.release
+	return result, nil
+}
+
+func (s *acceptGateStore) Release() {
+	s.releaseOnce.Do(func() { close(s.release) })
+}
+
+type responseObservingListener struct {
+	net.Listener
+	writeErrors chan<- error
+}
+
+func (l *responseObservingListener) Accept() (net.Conn, error) {
+	connection, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &responseObservingConn{Conn: connection, writeErrors: l.writeErrors}, nil
+}
+
+type responseObservingConn struct {
+	net.Conn
+	writeErrors chan<- error
+}
+
+func (c *responseObservingConn) Write(body []byte) (int, error) {
+	written, err := c.Conn.Write(body)
+	if err != nil {
+		select {
+		case c.writeErrors <- err:
+		default:
+		}
+	}
+	return written, err
 }
 
 func eventuallyContinuity(t *testing.T, timeout time.Duration, condition func() bool) bool {
