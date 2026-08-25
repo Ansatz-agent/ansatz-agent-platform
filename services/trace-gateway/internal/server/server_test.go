@@ -151,7 +151,7 @@ func TestHandlerReturnsDuplicateDurableReceipt(t *testing.T) {
 	assertSuccess(t, response, inbox.ReceiptDuplicate)
 }
 
-func TestHandlerTriggersWorkerOnlyAfterAcceptedInboxBatch(t *testing.T) {
+func TestHandlerTriggersWorkerAfterAcceptedInboxBatch(t *testing.T) {
 	store := &recordingStore{result: inbox.AcceptResult{BatchID: batchID, Outcome: inbox.ReceiptAccepted}}
 	triggered := make(chan struct{}, 1)
 	handler := mustHandler(t, Config{

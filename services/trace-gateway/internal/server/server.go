@@ -244,7 +244,7 @@ func (s *Server) serveTrace(w http.ResponseWriter, request *http.Request, now ti
 		writeStorageUnavailable(w)
 		return http.StatusServiceUnavailable, len(body)
 	}
-	if result.Outcome == inbox.ReceiptAccepted && s.trigger != nil {
+	if s.trigger != nil {
 		s.trigger()
 	}
 	writeSuccess(w, headers.BatchID, result.Outcome)

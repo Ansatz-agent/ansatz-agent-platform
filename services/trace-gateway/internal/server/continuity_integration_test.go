@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -104,6 +105,162 @@ func TestAcceptGateStoreReturnsOnContextCancellationAfterDurableAcceptance(t *te
 	case <-time.After(time.Second):
 		t.Fatal("gate remained blocked after context cancellation")
 	}
+}
+
+func TestDuplicateReceiptWakesSleepingWorkerAfterFirstAcceptanceResultIsUnknown(t *testing.T) {
+	store, err := inbox.Open(filepath.Join(t.TempDir(), "inbox.db"), inbox.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = store.Close()
+		}
+	}()
+
+	workerStore := &idleObservingStore{Store: store, idle: make(chan struct{}, 2)}
+	upstream := &successfulCountingUpstream{delivered: make(chan struct{})}
+	worker := delivery.New(workerStore, upstream, delivery.Options{})
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	workerStopped := false
+	go func() { workerDone <- worker.Run(workerCtx) }()
+	defer func() {
+		if !workerStopped {
+			cancelWorker()
+			<-workerDone
+		}
+	}()
+
+	select {
+	case <-workerStore.idle:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not enter its empty-inbox wait")
+	}
+
+	admission := &firstAcceptanceResultUnknownStore{Store: store}
+	var triggers atomic.Int32
+	handler := mustHandler(t, Config{
+		Introspector: continuityIntrospector{tokenID: "duplicate-wake-token"},
+		Store:        admission,
+		Trigger: func() {
+			triggers.Add(1)
+			worker.Trigger()
+		},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	body := validBody(t)
+	first := httptest.NewRecorder()
+	firstRequest := validRequest(body)
+	firstRequest.Header.Set("Authorization", "Bearer "+continuityBearerOne)
+	handler.ServeHTTP(first, firstRequest)
+	if first.Code != http.StatusServiceUnavailable || first.Header().Get("X-Trace-Receipt") != "" {
+		t.Fatalf("first response status=%d headers=%v", first.Code, first.Header())
+	}
+	if triggers.Load() != 0 {
+		t.Fatalf("failed admission triggers = %d, want 0", triggers.Load())
+	}
+	select {
+	case <-upstream.delivered:
+		t.Fatal("failed admission attempt woke the worker")
+	default:
+	}
+
+	retry := httptest.NewRecorder()
+	retryRequest := validRequest(body)
+	retryRequest.Header.Set("Authorization", "Bearer "+continuityBearerTwo)
+	handler.ServeHTTP(retry, retryRequest)
+	assertSuccess(t, retry, inbox.ReceiptDuplicate)
+	if triggers.Load() != 1 {
+		t.Fatalf("duplicate receipt triggers = %d, want 1", triggers.Load())
+	}
+	select {
+	case <-upstream.delivered:
+	case <-time.After(time.Second):
+		t.Fatal("duplicate receipt did not wake the sleeping worker")
+	}
+	select {
+	case <-workerStore.idle:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not finish the duplicate-woken delivery")
+	}
+
+	cancelWorker()
+	workerErr := <-workerDone
+	workerStopped = true
+	if workerErr != nil {
+		t.Fatal(workerErr)
+	}
+	if upstream.Calls() != 1 {
+		t.Fatalf("upstream deliveries = %d, want 1", upstream.Calls())
+	}
+	receipts, err := store.CollectReceipts(context.Background(), time.Now().Add(31*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipts != 1 {
+		t.Fatalf("durable receipts = %d, want 1", receipts)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closed = true
+}
+
+type firstAcceptanceResultUnknownStore struct {
+	inbox.Store
+	once sync.Once
+}
+
+func (s *firstAcceptanceResultUnknownStore) Accept(ctx context.Context, envelope inbox.Envelope) (inbox.AcceptResult, error) {
+	result, err := s.Store.Accept(ctx, envelope)
+	if err != nil {
+		return result, err
+	}
+	unknown := false
+	s.once.Do(func() { unknown = true })
+	if unknown {
+		return inbox.AcceptResult{}, errors.New("sync accepted trace batch: injected result unknown")
+	}
+	return result, nil
+}
+
+type idleObservingStore struct {
+	inbox.Store
+	idle chan struct{}
+}
+
+func (s *idleObservingStore) PeekEligible(ctx context.Context, now time.Time) (*inbox.Batch, error) {
+	batch, err := s.Store.PeekEligible(ctx, now)
+	if err == nil && batch == nil {
+		select {
+		case s.idle <- struct{}{}:
+		default:
+		}
+	}
+	return batch, err
+}
+
+type successfulCountingUpstream struct {
+	mu        sync.Mutex
+	calls     int
+	delivered chan struct{}
+	once      sync.Once
+}
+
+func (u *successfulCountingUpstream) Send(_ context.Context, _ []byte) (delivery.Response, error) {
+	u.mu.Lock()
+	u.calls++
+	u.mu.Unlock()
+	u.once.Do(func() { close(u.delivered) })
+	return delivery.Response{Status: http.StatusOK}, nil
+}
+
+func (u *successfulCountingUpstream) Calls() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls
 }
 
 type continuityGateway struct {
