@@ -6,11 +6,11 @@
 
 ## 当前阶段
 
-**阶段：认证连续性与 Trace 离线补传已完成本地实现和验证，等待独立的 Git 交付与发布授权。**
+**阶段：认证连续性与 Trace 离线补传已完成本地实现、独立审查和最终验证，等待 Git 交付、安装包与部署授权。**
 
 客户端、认证服务与 Trace Gateway 的本地开发分支已实现并验证：认证服务暂时不可用时保持既有登录和本地对话能力；客户端重启可先从受保护缓存恢复；只有 Sign out 或可信且身份匹配的结构化撤销停止能力；Trace token 不再阻塞本地 Hermes；未上传 Trace 进入加密持久 outbox，恢复后 FIFO 补传；Gateway 在持久接收后才返回幂等 receipt。
 
-这些变更目前只存在于本地分支，**没有 push、PR、merge、installer build 或 deploy**。现网仍以既有部署报告为准。
+这些变更目前只存在于本地分支，**没有 push、PR、merge、installer package 或 deploy**。已完成一次未打包的客户端 production build 与本地 Playwright 验证；现网仍以既有部署报告为准。
 
 ## 里程碑
 
@@ -33,7 +33,7 @@
 
 ## 下一步
 
-1. 完成三仓最终 diff/secret 独立审阅，并保留本报告所列本地验证证据。
+1. 三仓最终 diff/secret 独立审阅与本地验证已经完成；交付使用报告中记录的精确 refs。
 2. 只有获得单独授权后，才 push 分支、创建 PR、合并、构建安装包或部署。
 3. 发布阶段另做 packaged macOS/Windows 与 staging/production acceptance；不得把当前本地 Playwright/Go harness 描述成 Windows 或生产运行时验证。
 
