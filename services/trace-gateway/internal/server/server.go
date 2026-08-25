@@ -160,8 +160,11 @@ func (s *Server) serveTrace(w http.ResponseWriter, request *http.Request, now ti
 	principal, err := s.introspector.Introspect(request.Context(), bearer)
 	if err != nil {
 		if errors.Is(err, auth.ErrExplicitRevocation) {
-			writeError(w, http.StatusForbidden, inactiveErrorCode(err, "session_revoked"))
-			return http.StatusForbidden, 0
+			if writeExplicitRevocation(w, err) {
+				return http.StatusForbidden, 0
+			}
+			writeError(w, http.StatusServiceUnavailable, "authentication_unavailable")
+			return http.StatusServiceUnavailable, 0
 		}
 		if errors.Is(err, auth.ErrRefreshRequired) {
 			writeError(w, http.StatusUnauthorized, inactiveErrorCode(err, "trace_token_refresh_required"))
@@ -346,6 +349,46 @@ func writeSuccess(w http.ResponseWriter, batchID string, outcome inbox.ReceiptOu
 	w.Header().Set("X-Trace-Receipt", string(outcome))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+func writeExplicitRevocation(w http.ResponseWriter, err error) bool {
+	var inactive *auth.InactiveError
+	if !errors.As(err, &inactive) || !inactive.Explicit ||
+		!explicitRevocationCode(inactive.Code) ||
+		!uuidV4Pattern.MatchString(inactive.AccountID) ||
+		!uuidV4Pattern.MatchString(inactive.SessionID) ||
+		!uuidV4Pattern.MatchString(inactive.InstallationID) || inactive.RevokedAt.IsZero() {
+		return false
+	}
+	body := struct {
+		State     string `json:"state"`
+		Code      string `json:"code"`
+		AccountID string `json:"account_id"`
+		SessionID string `json:"session_id"`
+		RevokedAt string `json:"revoked_at"`
+		Retryable bool   `json:"retryable"`
+	}{
+		State:     "revoked",
+		Code:      inactive.Code,
+		AccountID: inactive.AccountID,
+		SessionID: inactive.SessionID,
+		RevokedAt: inactive.RevokedAt.UTC().Format(time.RFC3339Nano),
+		Retryable: false,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(body)
+	return true
+}
+
+func explicitRevocationCode(code string) bool {
+	switch code {
+	case "account_disabled", "account_revoked", "session_revoked":
+		return true
+	default:
+		return false
+	}
 }
 
 func inactiveErrorCode(err error, fallback string) string {

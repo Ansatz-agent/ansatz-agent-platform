@@ -10,6 +10,7 @@ import secrets
 import struct
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -213,6 +214,64 @@ def _require_receipt(response: httpx.Response, batch_id: str, expected: str) -> 
     if receipt != expected:
         raise RuntimeError("trace upload returned an unexpected receipt")
     return receipt
+
+
+def require_structured_revocation(
+    response: httpx.Response,
+    *,
+    expected_account_id: str,
+    expected_session_id: str,
+) -> dict[str, str | bool]:
+    invalid = RuntimeError("trace upload did not return trusted revocation evidence")
+    if response.status_code != 403:
+        raise invalid
+    try:
+        body = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        raise invalid from None
+    required_keys = {
+        "account_id",
+        "code",
+        "retryable",
+        "revoked_at",
+        "session_id",
+        "state",
+    }
+    if not isinstance(body, dict) or set(body) != required_keys:
+        raise invalid
+    if (
+        body["state"] != "revoked"
+        or body["retryable"] is not False
+        or body["code"]
+        not in {"account_disabled", "account_revoked", "session_revoked"}
+        or body["account_id"] != expected_account_id
+        or body["session_id"] != expected_session_id
+        or not _canonical_uuid_v4(body["account_id"])
+        or not _canonical_uuid_v4(body["session_id"])
+        or not _rfc3339_timestamp(body["revoked_at"])
+    ):
+        raise invalid
+    return body
+
+
+def _canonical_uuid_v4(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return parsed.version == 4 and str(parsed) == value
+
+
+def _rfc3339_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or "T" not in value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def upload_user_trace(

@@ -24,8 +24,12 @@ var (
 )
 
 type InactiveError struct {
-	Code     string
-	Explicit bool
+	Code           string
+	Explicit       bool
+	AccountID      string
+	SessionID      string
+	InstallationID string
+	RevokedAt      time.Time
 }
 
 func (e *InactiveError) Error() string {
@@ -66,6 +70,7 @@ type introspectionResponse struct {
 	PlatformUserID   string `json:"platform_user_id"`
 	PlatformUsername string `json:"platform_username"`
 	InstallationID   string `json:"installation_id"`
+	RevokedAt        string `json:"revoked_at"`
 	ExpiresAt        string `json:"expires_at"`
 	Scope            string `json:"scope"`
 	Audience         string `json:"audience"`
@@ -118,10 +123,18 @@ func (i *Introspector) Introspect(ctx context.Context, bearer string) (Principal
 		case "token_expired", "token_rotated", "token_revoked", "invalid_token":
 			return Principal{}, &InactiveError{Code: "trace_token_refresh_required"}
 		case "session_revoked", "account_disabled", "account_revoked":
-			if !validUUIDv4(body.AccountID) || !validUUIDv4(body.SessionID) {
+			revokedAt, err := time.Parse(time.RFC3339, body.RevokedAt)
+			if err != nil || !validUUIDv4(body.AccountID) || !validUUIDv4(body.SessionID) || !validUUIDv4(body.InstallationID) {
 				return Principal{}, ErrUnavailable
 			}
-			return Principal{}, &InactiveError{Code: body.Reason, Explicit: true}
+			return Principal{}, &InactiveError{
+				Code:           body.Reason,
+				Explicit:       true,
+				AccountID:      body.AccountID,
+				SessionID:      body.SessionID,
+				InstallationID: body.InstallationID,
+				RevokedAt:      revokedAt,
+			}
 		default:
 			return Principal{}, ErrUnavailable
 		}

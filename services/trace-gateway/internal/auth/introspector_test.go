@@ -66,9 +66,9 @@ func TestIntrospectorClassifiesAdditiveInactiveReasons(t *testing.T) {
 		{"rotated", `{"active":false,"reason":"token_rotated"}`, ErrRefreshRequired, "trace_token_refresh_required"},
 		{"token revoked", `{"active":false,"reason":"token_revoked"}`, ErrRefreshRequired, "trace_token_refresh_required"},
 		{"invalid", `{"active":false,"reason":"invalid_token"}`, ErrRefreshRequired, "trace_token_refresh_required"},
-		{"session revoked", `{"active":false,"reason":"session_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222"}`, ErrExplicitRevocation, "session_revoked"},
-		{"account disabled", `{"active":false,"reason":"account_disabled","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222"}`, ErrExplicitRevocation, "account_disabled"},
-		{"account revoked", `{"active":false,"reason":"account_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222"}`, ErrExplicitRevocation, "account_revoked"},
+		{"session revoked", `{"active":false,"reason":"session_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"2099-08-23T14:00:00Z","extra":"ok"}`, ErrExplicitRevocation, "session_revoked"},
+		{"account disabled", `{"active":false,"reason":"account_disabled","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"2099-08-23T14:00:00Z"}`, ErrExplicitRevocation, "account_disabled"},
+		{"account revoked", `{"active":false,"reason":"account_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"2099-08-23T14:00:00Z"}`, ErrExplicitRevocation, "account_revoked"},
 		{"explicit reason without trusted identity", `{"active":false,"reason":"session_revoked","account_id":"not-a-uuid","session_id":"22222222-2222-4222-8222-222222222222"}`, ErrUnavailable, ""},
 		{"unknown", `{"active":false,"reason":"unknown_new_reason"}`, ErrUnavailable, ""},
 		{"missing", `{"active":false}`, ErrUnavailable, ""},
@@ -76,6 +76,47 @@ func TestIntrospectorClassifiesAdditiveInactiveReasons(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			assertIntrospectionError(t, test.body, test.want, test.code)
+		})
+	}
+}
+
+func TestIntrospectorCarriesOnlyTrustedExplicitRevocationEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"active":false,"reason":"account_disabled","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"2099-08-23T14:00:00Z","future_field":{"safe":"ignored"}}`)
+	}))
+	defer server.Close()
+
+	_, err := NewIntrospector(server.URL, testSecret, time.Second).Introspect(context.Background(), testBearer)
+	var inactive *InactiveError
+	if !errors.Is(err, ErrExplicitRevocation) || !errors.As(err, &inactive) {
+		t.Fatalf("error = %#v, want typed explicit revocation", err)
+	}
+	if inactive.Code != "account_disabled" ||
+		inactive.AccountID != "11111111-1111-4111-8111-111111111111" ||
+		inactive.SessionID != "22222222-2222-4222-8222-222222222222" ||
+		inactive.InstallationID != "33333333-3333-4333-8333-333333333333" ||
+		inactive.RevokedAt.Format(time.RFC3339) != "2099-08-23T14:00:00Z" {
+		t.Fatalf("revocation evidence = %#v", inactive)
+	}
+}
+
+func TestIntrospectorRejectsMalformedExplicitRevocationEvidence(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"missing account", `{"active":false,"reason":"session_revoked","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"2099-08-23T14:00:00Z"}`},
+		{"missing session", `{"active":false,"reason":"account_disabled","account_id":"11111111-1111-4111-8111-111111111111","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"2099-08-23T14:00:00Z"}`},
+		{"missing installation", `{"active":false,"reason":"account_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222","revoked_at":"2099-08-23T14:00:00Z"}`},
+		{"missing revoked time", `{"active":false,"reason":"session_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"33333333-3333-4333-8333-333333333333"}`},
+		{"invalid account", `{"active":false,"reason":"account_disabled","account_id":"not-a-uuid","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"2099-08-23T14:00:00Z"}`},
+		{"invalid session", `{"active":false,"reason":"account_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"not-a-uuid","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"2099-08-23T14:00:00Z"}`},
+		{"invalid installation", `{"active":false,"reason":"session_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"not-a-uuid","revoked_at":"2099-08-23T14:00:00Z"}`},
+		{"invalid revoked time", `{"active":false,"reason":"session_revoked","account_id":"11111111-1111-4111-8111-111111111111","session_id":"22222222-2222-4222-8222-222222222222","installation_id":"33333333-3333-4333-8333-333333333333","revoked_at":"not-a-time"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertIntrospectionError(t, test.body, ErrUnavailable, "")
 		})
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -202,7 +203,6 @@ func TestHandlerRejectsInvalidContractsWithFixedNoStoreErrors(t *testing.T) {
 		{"idempotency conflict", Config{Introspector: fakeIntrospector{}, Store: &recordingStore{err: inbox.ErrIdempotencyConflict}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 409, "idempotency_conflict"},
 		{"storage unavailable", Config{Introspector: fakeIntrospector{}, Store: &recordingStore{err: inbox.ErrStorageUnavailable}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 507, "storage_unavailable"},
 		{"refresh required", Config{Introspector: fakeIntrospector{err: &auth.InactiveError{Code: "trace_token_refresh_required"}}, Store: acceptedStore()}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 401, "trace_token_refresh_required"},
-		{"explicit revocation", Config{Introspector: fakeIntrospector{err: &auth.InactiveError{Code: "session_revoked", Explicit: true}}, Store: acceptedStore()}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 403, "session_revoked"},
 		{"auth unavailable", Config{Introspector: fakeIntrospector{err: auth.ErrUnavailable}, Store: acceptedStore()}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 503, "authentication_unavailable"},
 		{"too large", Config{Introspector: fakeIntrospector{}, Store: acceptedStore(), MaxBodyBytes: 32}, func(t *testing.T) *http.Request { return validRequest(bytes.Repeat([]byte("x"), 33)) }, 413, "payload_too_large"},
 		{"rate limited", Config{Introspector: fakeIntrospector{}, Store: acceptedStore(), Limiter: denyLimiter{}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 429, "rate_limited"},
@@ -226,6 +226,53 @@ func TestHandlerRejectsInvalidContractsWithFixedNoStoreErrors(t *testing.T) {
 			}
 			if bytes.Contains(response.Body.Bytes(), []byte(uploadBearer)) {
 				t.Fatal("bearer leaked in error")
+			}
+		})
+	}
+}
+
+func TestHandlerReturnsExactStructuredExplicitRevocationEvidence(t *testing.T) {
+	for _, code := range []string{"session_revoked", "account_disabled", "account_revoked"} {
+		t.Run(code, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler := mustHandler(t, Config{
+				Introspector: fakeIntrospector{err: &auth.InactiveError{
+					Code:           code,
+					Explicit:       true,
+					AccountID:      "22222222-2222-4222-8222-222222222222",
+					SessionID:      "33333333-3333-4333-8333-333333333333",
+					InstallationID: "44444444-4444-4444-8444-444444444444",
+					RevokedAt:      time.Date(2099, 8, 23, 14, 0, 0, 0, time.UTC),
+				}},
+				Store: acceptedStore(),
+			})
+			handler.ServeHTTP(response, validRequest(validBody(t)))
+
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body=%s", response.Code, response.Body.String())
+			}
+			if response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("headers = %v", response.Header())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]any{
+				"account_id": "22222222-2222-4222-8222-222222222222",
+				"code":       code,
+				"retryable":  false,
+				"revoked_at": "2099-08-23T14:00:00Z",
+				"session_id": "33333333-3333-4333-8333-333333333333",
+				"state":      "revoked",
+			}
+			if !reflect.DeepEqual(body, want) {
+				t.Fatalf("body = %#v, want %#v", body, want)
+			}
+			for _, secret := range []string{uploadBearer, "payload", "44444444-4444-4444-8444-444444444444"} {
+				if strings.Contains(response.Body.String(), secret) {
+					t.Fatalf("unsafe value leaked in response: %q", secret)
+				}
 			}
 		})
 	}
