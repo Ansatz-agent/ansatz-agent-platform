@@ -25,7 +25,7 @@
 - The direct Gateway race runs only with no older per-account backlog and one admission/send owner; otherwise the batch commits locally and joins FIFO.
 - An `accepted` or `duplicate` Gateway receipt cancels an uncommitted append or tombstones/reclaims an already committed payload. Successful Trace/span payload bytes are not retained locally.
 - Gateway acceptance keys are trusted `account_id + batch_id`; Trace token ID is never part of idempotency identity.
-- Gateway accepted-but-undelivered payloads are never evicted automatically. A storage safety failure rejects new acceptance with HTTP 507.
+- Gateway accepted-but-undelivered payloads are never evicted automatically. A storage safety failure rejects new acceptance with retryable HTTP 503, `Retry-After`, and an OTLP protobuf response.
 - Use the Conda environment `dl` for Python verification and never create a project-local virtual environment.
 - Never execute a `.sh` file directly; invoke it as `bash path/to/script.sh`.
 - No push, PR, deployment, destructive cleanup, production mutation, or installer release is authorized by this plan.
@@ -887,7 +887,7 @@ if (receipt) {
 }
 ```
 
-Apply the race independently and sequentially to every normal split batch so all pieces have a durable owner before the loopback request succeeds. Loopback body read is capped at 64 MiB; `splitOtlpExportTraceRequest(..., 8 * 1024 * 1024)` runs before admission and preserves source order. Every oversize span is durably written through `quarantineInput()` before Relay receives a non-success diagnostic response; an oversize span never prevents later spans/resources from being admitted. Authentication/token unavailability disables only the cloud contender. If local and cloud both fail, return HTTP 507 without claiming persistence. Gateway 400, 409, 413, and 415 quarantine; 401 refreshes only Trace credential and resends the same batch; 403 is forwarded as explicit revocation evidence; 429/5xx/network leave or create the local head. A matching Gateway receipt always cancels/tombstones local bytes; successful Trace/span payloads are not retained.
+Apply the race independently and sequentially to every normal split batch so all pieces have a durable owner before the loopback request succeeds. Loopback body read is capped at 64 MiB; `splitOtlpExportTraceRequest(..., 8 * 1024 * 1024)` runs before admission and preserves source order. Every oversize span is durably written through `quarantineInput()` before Relay receives a non-success diagnostic response; an oversize span never prevents later spans/resources from being admitted. Authentication/token unavailability disables only the cloud contender. If local and cloud both fail, return retryable HTTP 503 without claiming persistence. Gateway 400, 409, 413, and 415 quarantine; 401 refreshes only Trace credential and resends the same batch; 403 is forwarded as explicit revocation evidence; 429/5xx/network leave or create the local head. A matching Gateway receipt always cancels/tombstones local bytes; successful Trace/span payloads are not retained.
 
 - [ ] **Step 4: Run forwarder/outbox tests GREEN, then remove old queue files**
 
@@ -1336,7 +1336,7 @@ func TestHandlerAcknowledgesOnlySyncedInboxOwnership(t *testing.T) {
 }
 ```
 
-Add table rows for missing/duplicate/invalid idempotency headers, digest mismatch, same key/different digest 409, store-full 507, refresh-required 401 code, explicit revoke 403 code, auth unavailable 503 code, and duplicate durable receipt.
+Add table rows for missing/duplicate/invalid idempotency headers, digest mismatch, same key/different digest 409, store-full retryable 503 with `Retry-After` and an OTLP protobuf response, refresh-required 401 code, explicit revoke 403 code, auth unavailable 503 code, and duplicate durable receipt.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -1640,7 +1640,7 @@ def test_trace_continuity_runbook_documents_exact_storage_and_recovery_contract(
     for required in (
         "2 GiB per account", "30 days", "64 MiB segment", "AES-256-GCM",
         "Brotli", "1 GiB or 5%", "64 GiB", "10 GiB", "720h",
-        "accepted", "duplicate", "507 storage_unavailable", "rollback",
+        "accepted", "duplicate", "503 storage_unavailable", "rollback",
     ):
         self.assertIn(required, text)
 ```
@@ -1665,7 +1665,7 @@ The runbook must give exact read-only diagnostic commands, bbolt backup/restore 
 - Client: 2 GiB per account, 30 days, 64 MiB segment, Brotli then AES-256-GCM.
 - Client reserve: the greater of 1 GiB or 5% of the containing volume.
 - Gateway: 64 GiB bbolt ceiling, 10 GiB minimum free space, 720h receipts.
-- `accepted` and `duplicate` transfer durable ownership; `507 storage_unavailable` does not.
+- `accepted` and `duplicate` transfer durable ownership; retryable `503 storage_unavailable` does not.
 
 ## Rollback invariant
 

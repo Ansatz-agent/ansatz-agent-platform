@@ -217,6 +217,37 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         ):
             self.assertRegex(text, rf"(?m)^{required}=<generated-owner-only>$")
 
+    def test_trace_continuity_runbook_documents_exact_storage_and_recovery_contract(self) -> None:
+        path = ROOT / "docs" / "runbooks" / "trace-upload-continuity.md"
+        self.assertTrue(path.is_file(), f"missing {path}")
+        text = path.read_text(encoding="utf-8")
+        for required in (
+            "2 GiB per account",
+            "30 days",
+            "64 MiB segment",
+            "Brotli then AES-256-GCM",
+            "greater of 1 GiB or 5%",
+            "64 GiB bbolt ceiling",
+            "10 GiB minimum free space",
+            "720h receipts",
+            "accepted-undelivered data is never auto-evicted",
+            "accepted",
+            "duplicate",
+            "503 storage_unavailable",
+            "Retry-After",
+            "application/x-protobuf",
+            "key loss",
+            "owner mismatch",
+            "read-only diagnostics",
+            "offline compaction",
+            "Sign out preserves data",
+            "structured revocation pauses upload",
+            "rollback",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, text)
+        self.assertNotIn("507 storage_unavailable", text)
+
 
 if __name__ == "__main__":
     unittest.main()
