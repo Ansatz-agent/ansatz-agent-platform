@@ -11,7 +11,7 @@ pull request, packaged for release, or deployed.
 
 | Repository | Local branch | Verified ref |
 |---|---|---|
-| `agent-hermes-client` | `feature/auth-trace-continuity` | `b79869e29d5b8c7b46a494bf0dbf1489cd87260b` |
+| `agent-hermes-client` | `feature/auth-trace-continuity` | `c179d6659fbbd3d353938b81fc8123d10c5b7cf6` |
 | `agent-langfuse-server` | `feature/auth-continuity-protocol` | `b1c920dc190d7ed0ef5ef09ac8a69e29f8986c91` |
 | `ansatz-agent-platform` / Trace Gateway | `feature/trace-ingest-continuity` | runtime evidence through `02491c4af89390e093166a5f98eb3110bbebb1fc`; subsequent commits are documentation-only |
 
@@ -78,6 +78,7 @@ client suites merely to reproduce the same evidence.
 |---|---|---|
 | Client final integration, focused Electron | Auth coordinator/bridge/gate, Trace outbox/forwarder/recovery/runtime, and continuity integration suites | **123/123 passed** |
 | Client migration review fixes | Durable legacy predecessor recovery, receipt-only dedupe rebinding, cross-namespace FIFO, and background bounded migration | **22/22 Electron and 1/1 Python passed** |
+| Client final migration gate | Exact legacy-bootstrap continuity proof, cross-account fail-closed behavior, and cloud-send barrier while local capture remains available | **43/43 Electron and 1/1 Python passed** |
 | Client Python | Authentication policy, Relay projection, and continuity-focused tests | **152 passed, 6 skipped** |
 | Client static/format gates | Desktop typecheck, lint, and format checks | **clean** |
 | Client full Electron regression | One necessary full-suite run made earlier in the integration cycle | **1606 passed, 3 skipped** |
@@ -93,6 +94,11 @@ Sign out data preservation. Gateway integration tests cover lost client
 response, restart, durable duplicate receipt, FIFO recovery, and retryable
 storage failure. These are local deterministic harnesses; they are not a claim
 that the new branches are running in production.
+
+During the final main-thread verification, the first parallel focused run had
+one listener-close socket timing failure (42/43). The exact failing test passed
+when isolated, and the complete three-file focused group then passed 43/43.
+This timing observation is retained here rather than silently discarded.
 
 ## Requirement evidence summary
 
