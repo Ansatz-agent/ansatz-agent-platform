@@ -209,6 +209,9 @@ class SendGatewayTraceTest(unittest.TestCase):
             ("unknown code", 403, {**good, "code": "future_reason"}),
             ("extra field", 403, {**good, "detail": secret}),
             ("bad timestamp", 403, {**good, "revoked_at": "not-a-time"}),
+            ("basic date", 403, {**good, "revoked_at": "20260823T140000+00:00"}),
+            ("week date", 403, {**good, "revoked_at": "2026-W34-7T14:00:00+00:00"}),
+            ("seconds offset", 403, {**good, "revoked_at": "2026-08-23T14:00:00+00:00:30"}),
         )
         for label, status, body in cases:
             with self.subTest(label=label):

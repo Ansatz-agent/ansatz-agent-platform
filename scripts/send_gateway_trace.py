@@ -6,15 +6,21 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import struct
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+
+
+_RFC3339_TIMESTAMP = re.compile(
+    r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\Z"
+)
 
 
 def _varint(value: int) -> bytes:
@@ -265,13 +271,14 @@ def _canonical_uuid_v4(value: object) -> bool:
 
 
 def _rfc3339_timestamp(value: object) -> bool:
-    if not isinstance(value, str) or "T" not in value:
+    if not isinstance(value, str) or _RFC3339_TIMESTAMP.fullmatch(value) is None:
         return False
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return False
-    return parsed.tzinfo is not None
+    return parsed.utcoffset() is not None
 
 
 def upload_user_trace(
