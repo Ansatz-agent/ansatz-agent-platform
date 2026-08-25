@@ -11,7 +11,7 @@ pull request, packaged for release, or deployed.
 
 | Repository | Local branch | Verified ref |
 |---|---|---|
-| `agent-hermes-client` | `feature/auth-trace-continuity` | `4733000de552a5c2c0eab2fb8d9502e4fd5f0742` |
+| `agent-hermes-client` | `feature/auth-trace-continuity` | `b79869e29d5b8c7b46a494bf0dbf1489cd87260b` |
 | `agent-langfuse-server` | `feature/auth-continuity-protocol` | `b1c920dc190d7ed0ef5ef09ac8a69e29f8986c91` |
 | `ansatz-agent-platform` / Trace Gateway | `feature/trace-ingest-continuity` | runtime evidence through `02491c4af89390e093166a5f98eb3110bbebb1fc`; subsequent commits are documentation-only |
 
@@ -77,6 +77,7 @@ client suites merely to reproduce the same evidence.
 | Scope | Evidence | Result |
 |---|---|---|
 | Client final integration, focused Electron | Auth coordinator/bridge/gate, Trace outbox/forwarder/recovery/runtime, and continuity integration suites | **123/123 passed** |
+| Client migration review fixes | Durable legacy predecessor recovery, receipt-only dedupe rebinding, cross-namespace FIFO, and background bounded migration | **22/22 Electron and 1/1 Python passed** |
 | Client Python | Authentication policy, Relay projection, and continuity-focused tests | **152 passed, 6 skipped** |
 | Client static/format gates | Desktop typecheck, lint, and format checks | **clean** |
 | Client full Electron regression | One necessary full-suite run made earlier in the integration cycle | **1606 passed, 3 skipped** |
