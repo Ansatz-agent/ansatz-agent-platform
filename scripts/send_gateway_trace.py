@@ -6,13 +6,21 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import struct
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+
+
+_RFC3339_TIMESTAMP = re.compile(
+    r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\Z"
+)
 
 
 def _varint(value: int) -> bytes:
@@ -205,6 +213,74 @@ def _require(response: httpx.Response, expected: set[int], boundary: str) -> Non
         raise RuntimeError(f"{boundary} returned HTTP {response.status_code}")
 
 
+def _require_receipt(response: httpx.Response, batch_id: str, expected: str) -> str:
+    if response.headers.get("x-trace-batch-id") != batch_id:
+        raise RuntimeError("trace upload returned a mismatched batch receipt")
+    receipt = response.headers.get("x-trace-receipt")
+    if receipt != expected:
+        raise RuntimeError("trace upload returned an unexpected receipt")
+    return receipt
+
+
+def require_structured_revocation(
+    response: httpx.Response,
+    *,
+    expected_account_id: str,
+    expected_session_id: str,
+) -> dict[str, str | bool]:
+    invalid = RuntimeError("trace upload did not return trusted revocation evidence")
+    if response.status_code != 403:
+        raise invalid
+    try:
+        body = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        raise invalid from None
+    required_keys = {
+        "account_id",
+        "code",
+        "retryable",
+        "revoked_at",
+        "session_id",
+        "state",
+    }
+    if not isinstance(body, dict) or set(body) != required_keys:
+        raise invalid
+    if (
+        body["state"] != "revoked"
+        or body["retryable"] is not False
+        or body["code"]
+        not in {"account_disabled", "account_revoked", "session_revoked"}
+        or body["account_id"] != expected_account_id
+        or body["session_id"] != expected_session_id
+        or not _canonical_uuid_v4(body["account_id"])
+        or not _canonical_uuid_v4(body["session_id"])
+        or not _rfc3339_timestamp(body["revoked_at"])
+    ):
+        raise invalid
+    return body
+
+
+def _canonical_uuid_v4(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return parsed.version == 4 and str(parsed) == value
+
+
+def _rfc3339_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or _RFC3339_TIMESTAMP.fullmatch(value) is None:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return False
+    return parsed.utcoffset() is not None
+
+
 def upload_user_trace(
     credentials: dict[str, str],
     label: str,
@@ -244,6 +320,8 @@ def upload_user_trace(
         root_span_id=root_span_id,
         start_ns=start_ns,
     )
+    batch_id = str(uuid.uuid4())
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
 
     with httpx.Client(
         transport=transport,
@@ -299,11 +377,15 @@ def upload_user_trace(
             "X-Trace-Entrypoint": "voice" if label == "B" else "desktop",
             "X-Trace-Run-ID": run_id,
             "X-Telemetry-Schema-Version": "1",
+            "Idempotency-Key": batch_id,
+            "X-Trace-Payload-SHA256": payload_sha256,
         }
         upload = client.post(upload_url, content=payload, headers=headers)
         _require(upload, {200}, "trace upload")
+        first_receipt = _require_receipt(upload, batch_id, "accepted")
         retry = client.post(upload_url, content=payload, headers=headers)
         _require(retry, {200}, "identical trace retry")
+        retry_receipt = _require_receipt(retry, batch_id, "duplicate")
 
     return {
         "label": label,
@@ -316,6 +398,8 @@ def upload_user_trace(
         "entrypoint": "voice" if label == "B" else "desktop",
         "upload_status": upload.status_code,
         "retry_status": retry.status_code,
+        "first_receipt": first_receipt,
+        "retry_receipt": retry_receipt,
     }
 
 

@@ -32,6 +32,7 @@ var canonicalKeys = map[string]struct{}{
 	"hermes.run.id":                      {},
 	"telemetry.schema.version":           {},
 	"trace.gateway.request.id":           {},
+	"trace.gateway.batch.id":             {},
 	"langfuse.trace.input":               {},
 	"langfuse.trace.output":              {},
 	"langfuse.observation.type":          {},
@@ -46,11 +47,11 @@ func Canonicalize(
 	request *collectortracepb.ExportTraceServiceRequest,
 	principal auth.Principal,
 	headers Headers,
-	gatewayRequestID string,
+	batchID string,
 ) error {
-	if request == nil || principal.UserID == "" || principal.Username == "" || principal.InstallationID == "" ||
+	if request == nil || principal.AccountID == "" || principal.Username == "" || principal.InstallationID == "" ||
 		headers.SessionID == "" || headers.Entrypoint == "" || headers.RunID == "" ||
-		headers.SchemaVersion != "1" || gatewayRequestID == "" {
+		headers.SchemaVersion != "1" || batchID == "" {
 		return errors.New("invalid canonical identity")
 	}
 	for _, resourceSpans := range request.ResourceSpans {
@@ -76,8 +77,8 @@ func Canonicalize(
 				span.Attributes = projectRelayForLangfuse(span.Name, span.Attributes)
 				span.Attributes = append(
 					span.Attributes,
-					stringAttribute("user.id", principal.UserID),
-					stringAttribute("langfuse.user.id", principal.UserID),
+					stringAttribute("user.id", principal.AccountID),
+					stringAttribute("langfuse.user.id", principal.AccountID),
 					stringAttribute("langfuse.trace.metadata.username", principal.Username),
 					stringAttribute("session.id", headers.SessionID),
 					stringAttribute("langfuse.session.id", headers.SessionID),
@@ -97,9 +98,9 @@ func Canonicalize(
 		}
 		resourceSpans.Resource.Attributes = append(
 			resourceSpans.Resource.Attributes,
-			stringAttribute("platform.user.id", principal.UserID),
-			stringAttribute("user.id", principal.UserID),
-			stringAttribute("langfuse.user.id", principal.UserID),
+			stringAttribute("platform.user.id", principal.AccountID),
+			stringAttribute("user.id", principal.AccountID),
+			stringAttribute("langfuse.user.id", principal.AccountID),
 			stringAttribute("langfuse.trace.metadata.username", principal.Username),
 			stringAttribute("client.installation.id", principal.InstallationID),
 			stringAttribute("hermes.session.id", headers.SessionID),
@@ -109,7 +110,7 @@ func Canonicalize(
 			stringAttribute("hermes.entrypoint", headers.Entrypoint),
 			stringAttribute("hermes.run.id", headers.RunID),
 			stringAttribute("telemetry.schema.version", "1"),
-			stringAttribute("trace.gateway.request.id", gatewayRequestID),
+			stringAttribute("trace.gateway.batch.id", batchID),
 		)
 	}
 	return nil
