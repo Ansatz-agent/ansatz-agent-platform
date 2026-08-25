@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,18 +27,23 @@ var (
 	quarantineBucket = []byte("quarantine")
 )
 
-const defaultReceiptRetention = 30 * 24 * time.Hour
+const (
+	defaultReceiptRetention     = 30 * 24 * time.Hour
+	defaultMaxQuarantineEntries = 1000
+)
 
 type BoltStore struct {
-	db               *bolt.DB
-	receiptRetention time.Duration
-	storageGuard     StorageGuard
-	now              func() time.Time
-	syncFn           func() error
-	writeMu          sync.Mutex
-	closed           bool
-	pageSize         int
-	allocSize        int
+	db                   *bolt.DB
+	receiptRetention     time.Duration
+	quarantineRetention  time.Duration
+	maxQuarantineEntries int
+	storageGuard         StorageGuard
+	now                  func() time.Time
+	syncFn               func() error
+	writeMu              sync.Mutex
+	closed               atomic.Bool
+	pageSize             int
+	allocSize            int
 }
 
 type storedBatch struct {
@@ -71,11 +78,18 @@ func Open(path string, options Options) (*BoltStore, error) {
 	if path == "" {
 		return nil, errors.New("trace inbox path is required")
 	}
-	if options.ReceiptRetention < 0 || options.MaxDBBytes < 0 || options.MinFreeBytes < 0 || options.AllocSize < 0 || options.OpenTimeout < 0 {
+	if options.ReceiptRetention < 0 || options.QuarantineRetention < 0 || options.MaxQuarantineEntries < 0 ||
+		options.MaxDBBytes < 0 || options.MinFreeBytes < 0 || options.AllocSize < 0 || options.OpenTimeout < 0 {
 		return nil, errors.New("trace inbox options must not be negative")
 	}
 	if options.ReceiptRetention == 0 {
 		options.ReceiptRetention = defaultReceiptRetention
+	}
+	if options.QuarantineRetention == 0 {
+		options.QuarantineRetention = options.ReceiptRetention
+	}
+	if options.MaxQuarantineEntries == 0 {
+		options.MaxQuarantineEntries = defaultMaxQuarantineEntries
 	}
 	if options.OpenTimeout == 0 {
 		options.OpenTimeout = time.Second
@@ -92,11 +106,13 @@ func Open(path string, options Options) (*BoltStore, error) {
 		db.AllocSize = options.AllocSize
 	}
 	store := &BoltStore{
-		db:               db,
-		receiptRetention: options.ReceiptRetention,
-		now:              options.Now,
-		pageSize:         db.Info().PageSize,
-		allocSize:        db.AllocSize,
+		db:                   db,
+		receiptRetention:     options.ReceiptRetention,
+		quarantineRetention:  options.QuarantineRetention,
+		maxQuarantineEntries: options.MaxQuarantineEntries,
+		now:                  options.Now,
+		pageSize:             db.Info().PageSize,
+		allocSize:            db.AllocSize,
 	}
 	store.syncFn = db.Sync
 	if options.StorageGuard != nil {
@@ -132,7 +148,7 @@ func (s *BoltStore) Accept(ctx context.Context, env Envelope) (AcceptResult, err
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return AcceptResult{}, ErrClosed
 	}
 	var result AcceptResult
@@ -191,6 +207,11 @@ func (s *BoltStore) Accept(ctx context.Context, env Envelope) (AcceptResult, err
 	if err != nil {
 		return AcceptResult{}, err
 	}
+	// A duplicate writes no state, so skipping the fsync cannot weaken the
+	// pre-ACK durability guarantee for newly accepted batches.
+	if result.Outcome == ReceiptDuplicate {
+		return result, nil
+	}
 	if err := s.syncFn(); err != nil {
 		return AcceptResult{}, fmt.Errorf("sync accepted trace batch: %w", err)
 	}
@@ -201,13 +222,8 @@ func (s *BoltStore) PeekEligible(ctx context.Context, now time.Time) (*Batch, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.closed {
-		return nil, ErrClosed
-	}
 	var result *Batch
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		fifoKey, batchKey := tx.Bucket(fifoBucket).Cursor().First()
 		if fifoKey == nil {
 			return nil
@@ -240,13 +256,8 @@ func (s *BoltStore) NextRetryAt(ctx context.Context) (time.Time, error) {
 	if err := ctx.Err(); err != nil {
 		return time.Time{}, err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.closed {
-		return time.Time{}, ErrClosed
-	}
 	var nextRetry time.Time
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		_, batchKey := tx.Bucket(fifoBucket).Cursor().First()
 		if batchKey == nil {
 			return nil
@@ -343,17 +354,54 @@ func (s *BoltStore) MarkQuarantined(ctx context.Context, accountID, batchID, err
 	})
 }
 
+// CollectReceipts garbage-collects terminal state only: delivered receipts
+// past the receipt retention, quarantined payloads and receipts past the
+// quarantine retention, and the oldest quarantined payloads above the size
+// cap (their receipts stay for idempotency until retention expires). Pending
+// receipts and accepted-undelivered batches are never touched, and nothing is
+// fsynced when no state changed.
 func (s *BoltStore) CollectReceipts(ctx context.Context, now time.Time) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.closed.Load() {
+		return 0, ErrClosed
+	}
 	collected := 0
-	err := s.updateAndSync(ctx, func(tx *bolt.Tx) error {
-		cutoff := now.Add(-s.receiptRetention)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		receiptCutoff := now.Add(-s.receiptRetention)
+		quarantineCutoff := now.Add(-s.quarantineRetention)
+		quarantine := tx.Bucket(quarantineBucket)
 		cursor := tx.Bucket(receiptsBucket).Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
 			receipt, err := decodeReceipt(value)
 			if err != nil {
 				return err
 			}
-			if receipt.State != receiptDelivered || receipt.CompletedAt.IsZero() || receipt.CompletedAt.After(cutoff) {
+			if receipt.CompletedAt.IsZero() {
+				continue
+			}
+			switch receipt.State {
+			case receiptDelivered:
+				if receipt.CompletedAt.After(receiptCutoff) {
+					continue
+				}
+			case receiptQuarantined:
+				if receipt.CompletedAt.After(quarantineCutoff) {
+					continue
+				}
+				if quarantine.Get(key) != nil {
+					if err := quarantine.Delete(key); err != nil {
+						return err
+					}
+					collected++
+				}
+			default:
 				continue
 			}
 			if err := cursor.Delete(); err != nil {
@@ -361,15 +409,151 @@ func (s *BoltStore) CollectReceipts(ctx context.Context, now time.Time) (int, er
 			}
 			collected++
 		}
+		evicted, err := evictQuarantineOverflow(quarantine, s.maxQuarantineEntries)
+		collected += evicted
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	if collected == 0 {
+		return 0, nil
+	}
+	if err := s.syncFn(); err != nil {
+		return 0, err
+	}
+	return collected, nil
+}
+
+// evictQuarantineOverflow deletes the oldest quarantined payloads (by original
+// acceptance sequence) above the configured cap. Receipts are intentionally
+// preserved so account_id+batch_id idempotency outlives the payload.
+func evictQuarantineOverflow(quarantine *bolt.Bucket, maximum int) (int, error) {
+	type entry struct {
+		sequence uint64
+		key      []byte
+	}
+	var entries []entry
+	err := quarantine.ForEach(func(key, value []byte) error {
+		batch, err := decodeBatch(value)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, entry{sequence: batch.Sequence, key: append([]byte(nil), key...)})
 		return nil
 	})
-	return collected, err
+	if err != nil || len(entries) <= maximum {
+		return 0, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].sequence < entries[j].sequence })
+	evicted := 0
+	for _, overflow := range entries[:len(entries)-maximum] {
+		if err := quarantine.Delete(overflow.key); err != nil {
+			return evicted, err
+		}
+		evicted++
+	}
+	return evicted, nil
+}
+
+// ReplayQuarantined moves one quarantined batch back to the FIFO tail with a
+// fresh attempt budget and returns its receipt to the pending state, keeping
+// the same account_id+batch_id key so duplicate uploads still coalesce.
+func (s *BoltStore) ReplayQuarantined(ctx context.Context, accountID, batchID string) error {
+	return s.updateAndSync(ctx, func(tx *bolt.Tx) error {
+		return s.replayQuarantined(tx, receiptKey(accountID, batchID))
+	})
+}
+
+// ReplayAllQuarantined replays every quarantined batch in original acceptance
+// order and reports how many were requeued.
+func (s *BoltStore) ReplayAllQuarantined(ctx context.Context) (int, error) {
+	replayed := 0
+	err := s.updateAndSync(ctx, func(tx *bolt.Tx) error {
+		type entry struct {
+			sequence uint64
+			key      []byte
+		}
+		var entries []entry
+		if err := tx.Bucket(quarantineBucket).ForEach(func(key, value []byte) error {
+			batch, err := decodeBatch(value)
+			if err != nil {
+				return err
+			}
+			entries = append(entries, entry{sequence: batch.Sequence, key: append([]byte(nil), key...)})
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].sequence < entries[j].sequence })
+		for _, quarantined := range entries {
+			if err := s.replayQuarantined(tx, quarantined.key); err != nil {
+				return err
+			}
+			replayed++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return replayed, nil
+}
+
+func (s *BoltStore) replayQuarantined(tx *bolt.Tx, key []byte) error {
+	encoded := tx.Bucket(quarantineBucket).Get(key)
+	if encoded == nil {
+		return ErrBatchNotFound
+	}
+	batch, err := decodeBatch(encoded)
+	if err != nil {
+		return err
+	}
+	sequence, err := tx.Bucket(metaBucket).NextSequence()
+	if err != nil {
+		return err
+	}
+	batch.Sequence = sequence
+	batch.Attempts = 0
+	batch.LastError = ""
+	batch.NextRetry = time.Time{}
+	requeued, err := json.Marshal(batch)
+	if err != nil {
+		return err
+	}
+	if err := s.storageGuard.Check(projectedAcceptanceGrowth(s.pageSize, s.allocSize, key, requeued, nil)); err != nil {
+		return err
+	}
+	if err := tx.Bucket(batchesBucket).Put(key, requeued); err != nil {
+		return err
+	}
+	if err := tx.Bucket(fifoBucket).Put(sequenceKey(sequence), key); err != nil {
+		return err
+	}
+	if err := tx.Bucket(quarantineBucket).Delete(key); err != nil {
+		return err
+	}
+	if tx.Bucket(receiptsBucket).Get(key) == nil {
+		receiptBytes, err := json.Marshal(storedReceipt{
+			AccountID: batch.AccountID, BatchID: batch.BatchID, PayloadSHA256: batch.PayloadSHA256,
+			Outcome: ReceiptAccepted, AcceptedAt: batch.AcceptedAt, State: receiptPending,
+		})
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(receiptsBucket).Put(key, receiptBytes)
+	}
+	return updateReceipt(tx, key, func(receipt *storedReceipt) {
+		receipt.State = receiptPending
+		receipt.CompletedAt = time.Time{}
+		receipt.ErrorClass = ""
+	})
 }
 
 func (s *BoltStore) Sync() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return ErrClosed
 	}
 	return s.syncFn()
@@ -378,13 +562,30 @@ func (s *BoltStore) Sync() error {
 func (s *BoltStore) Close() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return nil
 	}
-	s.closed = true
+	s.closed.Store(true)
 	syncErr := s.syncFn()
 	closeErr := s.db.Close()
 	return errors.Join(syncErr, closeErr)
+}
+
+// view runs a read-only transaction without taking the writer mutex, so reads
+// are never serialized behind an in-flight update or fsync. This is safe
+// because bbolt's DB.Close documents that it blocks until every open
+// transaction (read-only included) finishes, so a View racing Close never
+// observes a released database; a View that starts after Close instead fails
+// with bolt.ErrDatabaseNotOpen, which is mapped to ErrClosed here.
+func (s *BoltStore) view(fn func(*bolt.Tx) error) error {
+	if s.closed.Load() {
+		return ErrClosed
+	}
+	err := s.db.View(fn)
+	if errors.Is(err, bolt.ErrDatabaseNotOpen) {
+		return ErrClosed
+	}
+	return err
 }
 
 func (s *BoltStore) updateAndSync(ctx context.Context, update func(*bolt.Tx) error) error {
@@ -393,7 +594,7 @@ func (s *BoltStore) updateAndSync(ctx context.Context, update func(*bolt.Tx) err
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return ErrClosed
 	}
 	if err := s.db.Update(func(tx *bolt.Tx) error {

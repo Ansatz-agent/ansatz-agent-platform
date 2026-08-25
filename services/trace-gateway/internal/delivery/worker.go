@@ -16,6 +16,13 @@ import (
 const (
 	defaultBaseRetry = time.Second
 	defaultMaxRetry  = 5 * time.Minute
+	// defaultRetryAfterCap bounds how long an upstream Retry-After header can
+	// delay the FIFO head, so one absurd delta-seconds value or far-future
+	// HTTP date cannot stall strict FIFO delivery indefinitely.
+	defaultRetryAfterCap = time.Hour
+	// defaultOperatorRetryLimit is the total delivery attempts granted to
+	// operator-fixable rejections (401/403/404) before quarantine.
+	defaultOperatorRetryLimit = 6
 	// minimumRetryDelay prevents a zero-jitter retry from immediately spinning
 	// against the upstream while preserving any longer valid Retry-After value.
 	minimumRetryDelay = time.Millisecond
@@ -39,17 +46,26 @@ type Options struct {
 	Random    func() float64
 	BaseRetry time.Duration
 	MaxRetry  time.Duration
+	// RetryAfterCap is the ceiling applied to parsed upstream Retry-After
+	// values. Zero selects defaultRetryAfterCap.
+	RetryAfterCap time.Duration
+	// OperatorRetryLimit is the total number of delivery attempts allowed for
+	// operator-fixable upstream rejections (401/403/404) before the batch is
+	// quarantined. Zero selects defaultOperatorRetryLimit.
+	OperatorRetryLimit int
 }
 
 // Worker owns one coalesced delivery loop for an inbox.
 type Worker struct {
-	store    inbox.Store
-	upstream Upstream
-	now      func() time.Time
-	random   func() float64
-	base     time.Duration
-	max      time.Duration
-	trigger  chan struct{}
+	store              inbox.Store
+	upstream           Upstream
+	now                func() time.Time
+	random             func() float64
+	base               time.Duration
+	max                time.Duration
+	retryAfterCap      time.Duration
+	operatorRetryLimit int
+	trigger            chan struct{}
 }
 
 // New constructs a worker. Run begins delivery immediately; Trigger can be
@@ -70,9 +86,17 @@ func New(store inbox.Store, upstream Upstream, options Options) *Worker {
 	if options.BaseRetry > options.MaxRetry {
 		options.BaseRetry = options.MaxRetry
 	}
+	if options.RetryAfterCap <= 0 {
+		options.RetryAfterCap = defaultRetryAfterCap
+	}
+	if options.OperatorRetryLimit <= 0 {
+		options.OperatorRetryLimit = defaultOperatorRetryLimit
+	}
 	return &Worker{
 		store: store, upstream: upstream, now: options.Now, random: options.Random,
-		base: options.BaseRetry, max: options.MaxRetry, trigger: make(chan struct{}, 1),
+		base: options.BaseRetry, max: options.MaxRetry,
+		retryAfterCap: options.RetryAfterCap, operatorRetryLimit: options.OperatorRetryLimit,
+		trigger: make(chan struct{}, 1),
 	}
 }
 
@@ -123,7 +147,7 @@ func (w *Worker) deliverHead(ctx context.Context, now time.Time) (bool, error) {
 		return false, err
 	}
 	response, sendErr := w.upstream.Send(ctx, batch.Payload)
-	switch classify(response.Status, sendErr) {
+	switch classify(response.Status, sendErr, batch.Attempts, w.operatorRetryLimit) {
 	case deliverySuccess:
 		return true, w.store.MarkDelivered(ctx, batch.AccountID, batch.BatchID, now)
 	case deliveryPermanent:
@@ -131,7 +155,7 @@ func (w *Worker) deliverHead(ctx context.Context, now time.Time) (bool, error) {
 	default:
 		retryNow := w.now()
 		retry := inbox.Retry{
-			NextRetry: fullJitter(batch.Attempts, retryNow, response.RetryAfter, w.base, w.max, w.random),
+			NextRetry: fullJitter(batch.Attempts, retryNow, response.RetryAfter, w.base, w.max, w.retryAfterCap, w.random),
 			LastError: safeRetryErrorClass(response.Status, sendErr),
 		}
 		return true, w.store.MarkRetry(ctx, batch.AccountID, batch.BatchID, retry)
@@ -175,12 +199,25 @@ const (
 	deliveryPermanent
 )
 
-func classify(status int, sendErr error) deliveryClass {
-	if sendErr != nil || status == http.StatusTooManyRequests || status >= 500 {
+// classify decides the outcome of one delivery attempt. Transport failures,
+// 408, 429, and 5xx are always retryable. Operator-fixable rejections
+// (401/403/404, e.g. rotated upstream credentials or a moved endpoint) are
+// retried until the batch has consumed operatorRetryLimit total attempts so a
+// misconfiguration window does not quarantine traffic, while keeping the FIFO
+// head stall bounded. Remaining 4xx statuses are permanent.
+func classify(status int, sendErr error, attempts, operatorRetryLimit int) deliveryClass {
+	if sendErr != nil || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500 {
 		return deliveryRetryable
 	}
 	if status >= 200 && status < 300 {
 		return deliverySuccess
+	}
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		if attempts+1 < operatorRetryLimit {
+			return deliveryRetryable
+		}
+		return deliveryPermanent
 	}
 	if status >= 400 && status < 500 {
 		return deliveryPermanent
@@ -199,7 +236,7 @@ func safeRetryErrorClass(status int, sendErr error) string {
 	return safeErrorClass(status)
 }
 
-func fullJitter(attempts int, now time.Time, retryAfter string, base, max time.Duration, random func() float64) time.Time {
+func fullJitter(attempts int, now time.Time, retryAfter string, base, max, retryAfterCap time.Duration, random func() float64) time.Time {
 	delay := base
 	for range attempts {
 		if delay >= max/2 {
@@ -218,7 +255,11 @@ func fullJitter(attempts int, now time.Time, retryAfter string, base, max time.D
 		jitter = 1
 	}
 	delay = time.Duration(float64(delay) * jitter)
-	if retryDelay := parseRetryAfter(retryAfter, now); retryDelay > delay {
+	retryDelay := parseRetryAfter(retryAfter, now)
+	if retryDelay > retryAfterCap {
+		retryDelay = retryAfterCap
+	}
+	if retryDelay > delay {
 		delay = retryDelay
 	}
 	if delay < minimumRetryDelay {

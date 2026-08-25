@@ -251,6 +251,53 @@ move the failed compacted file aside, restore the untouched original name,
 and restart. Accepted-undelivered batches and pending receipts must have the
 same counts before and after; compaction is not a retention or eviction tool.
 
+## Gateway retention, quarantine, and replay
+
+The Gateway runs a periodic in-process collector (default every hour,
+`TRACE_GATEWAY_GC_INTERVAL`) that removes only terminal state: delivered
+receipts older than `TRACE_GATEWAY_RECEIPT_RETENTION`, quarantined payloads
+and their receipts older than `TRACE_GATEWAY_QUARANTINE_RETENTION` (defaults
+to the receipt retention), and the oldest quarantined payloads above
+`TRACE_GATEWAY_MAX_QUARANTINE_ENTRIES` (default 1000). Size-cap eviction
+removes only the payload; the receipt stays until retention expires so
+`account_id`+`batch_id` idempotency is preserved. Accepted-undelivered batches
+and pending receipts are never collected under any setting, so steady-state
+delivered traffic and quarantine can no longer grow the database to the
+`TRACE_GATEWAY_MAX_DB_BYTES` safety ceiling.
+
+Delivery retry classification: transport failures, 408, 429, and 5xx retry
+with jittered backoff; a parsed upstream `Retry-After` is honored but clamped
+to a one-hour ceiling so a bad header cannot stall the strict-FIFO head
+indefinitely. Operator-fixable rejections (401/403/404 — rotated Langfuse
+keys, moved endpoint) get a bounded budget of delivery attempts before
+quarantine, giving the operator a window to fix configuration without losing
+the batch. Remaining 4xx statuses quarantine immediately.
+
+If the delivery worker ever stops outside of shutdown, the Gateway logs
+`trace delivery worker stopped`, stops admitting uploads, and exits non-zero
+so the orchestrator restarts it. The Gateway never keeps ACKing uploads while
+delivery is dead; accepted batches remain durable in the inbox across the
+restart.
+
+To replay quarantined batches after fixing the upstream cause, stop only
+`trace-gateway` (the bbolt exclusive lock guarantees replay cannot race live
+delivery — the command fails with an open timeout if the service is still
+running), then run the gateway binary's replay subcommand with the same inbox
+path:
+
+```bash
+# one batch
+TRACE_GATEWAY_INBOX_PATH=/data/trace-gateway/inbox.db /trace-gateway replay-quarantine <account_id> <batch_id>
+# every quarantined batch, in original acceptance order
+TRACE_GATEWAY_INBOX_PATH=/data/trace-gateway/inbox.db /trace-gateway replay-quarantine
+```
+
+Replay moves the payload back to the FIFO tail with a fresh attempt budget and
+returns its receipt to the pending state under the same `account_id`+`batch_id`
+key, so client re-uploads of the same batch still coalesce as duplicates.
+Restart the Gateway afterwards and confirm delivery via the health check and
+quarantine metrics.
+
 ## Rollout and rollback invariant
 
 Roll out the Gateway durable inbox and response fields before requiring them

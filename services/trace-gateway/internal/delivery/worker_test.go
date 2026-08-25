@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/http"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -92,6 +94,98 @@ func TestWorkerZeroJitterStillPersistsNonzeroRetryDelay(t *testing.T) {
 	}
 	if want := testNow.Add(time.Millisecond); !nextRetry.Equal(want) {
 		t.Fatalf("next retry = %s, want %s", nextRetry, want)
+	}
+}
+
+func TestWorkerClampsUpstreamRetryAfterToConfiguredCeiling(t *testing.T) {
+	tests := []struct {
+		name       string
+		retryAfter string
+		cap        time.Duration
+		want       time.Duration
+	}{
+		{"honors delta seconds under the ceiling", "600", time.Hour, 600 * time.Second},
+		{"clamps absurd delta seconds", "31536000", time.Hour, time.Hour},
+		{"clamps unparseable huge delta seconds", "999999999999999999999", time.Hour, time.Second},
+		{"clamps far future HTTP date", testNow.Add(365 * 24 * time.Hour).Format(http.TimeFormat), time.Hour, time.Hour},
+		{"honors near future HTTP date", testNow.Add(90 * time.Second).Format(http.TimeFormat), time.Hour, 90 * time.Second},
+		{"applies a custom ceiling", "600", 2 * time.Minute, 2 * time.Minute},
+		{"defaults the ceiling when unset", "999999999", 0, defaultRetryAfterCap},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, store := durableFixture(t, "one")
+			now := testNow
+			options := deterministicOptions(&now)
+			options.RetryAfterCap = test.cap
+			upstream := &fakeUpstream{responses: []response{{status: 503, retryAfter: test.retryAfter}}}
+
+			runOne(t, New(store, upstream, options))
+			nextRetry, err := store.NextRetryAt(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := testNow.Add(test.want); !nextRetry.Equal(want) {
+				t.Fatalf("next retry = %s, want %s", nextRetry, want)
+			}
+		})
+	}
+}
+
+func TestWorkerRetriesRequestTimeoutInsteadOfQuarantining(t *testing.T) {
+	_, store := durableFixture(t, "one")
+	now := testNow
+	upstream := &fakeUpstream{responses: []response{{status: 408}, {status: 200}}}
+	worker := New(store, upstream, deterministicOptions(&now))
+
+	runOne(t, worker)
+	batch := pending(t, store, now.Add(time.Second))
+	if batch.LastError != "upstream_408" {
+		t.Fatalf("last error = %q", batch.LastError)
+	}
+	now = now.Add(time.Second)
+	runUntilIdle(t, worker)
+	if !slices.Equal(upstream.seenPayloads(), []string{"one", "one"}) {
+		t.Fatalf("seen = %v", upstream.seenPayloads())
+	}
+}
+
+func TestWorkerGivesOperatorFixableRejectionsBoundedRetriesBeforeQuarantine(t *testing.T) {
+	for _, status := range []int{401, 403, 404} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			_, store := durableFixture(t, "one")
+			now := testNow
+			options := deterministicOptions(&now)
+			options.OperatorRetryLimit = 3
+			upstream := &fakeUpstream{responses: []response{
+				{status: status}, {status: status}, {status: status},
+			}}
+			recording := &recordingStore{Store: store}
+			worker := New(recording, upstream, options)
+
+			for range 2 {
+				runOne(t, worker)
+				now = now.Add(time.Minute)
+			}
+			if recording.quarantined != (quarantineCall{}) {
+				t.Fatalf("quarantined before the retry budget: %#v", recording.quarantined)
+			}
+			runOne(t, worker)
+			want := quarantineCall{accountID: "account-a", batchID: "one", errorClass: "upstream_" + strconv.Itoa(status), at: now}
+			if recording.quarantined != want {
+				t.Fatalf("quarantine = %#v, want %#v", recording.quarantined, want)
+			}
+			if !slices.Equal(upstream.seenPayloads(), []string{"one", "one", "one"}) {
+				t.Fatalf("seen = %v", upstream.seenPayloads())
+			}
+		})
+	}
+}
+
+func TestWorkerDefaultsOperatorRetryLimitToBoundedBudget(t *testing.T) {
+	worker := New(nil, nil, Options{})
+	if worker.operatorRetryLimit <= 0 {
+		t.Fatalf("operator retry limit = %d, want positive default", worker.operatorRetryLimit)
 	}
 }
 

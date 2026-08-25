@@ -2,16 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/inbox"
 )
 
 func TestLoadRuntimeConfigRequiresValidDurableInboxSettingsWithoutLeakingSecrets(t *testing.T) {
@@ -192,6 +198,247 @@ func TestShutdownGatewayClosesInboxAfterAdmissionFailure(t *testing.T) {
 	if !closed {
 		t.Fatal("inbox was not closed after admission shutdown failure")
 	}
+}
+
+func TestSuperviseGatewayFailsFastWhenDeliveryWorkerDies(t *testing.T) {
+	tests := []struct {
+		name      string
+		workerErr error
+	}{
+		{"worker error", errors.New("delivery worker crashed")},
+		{"unexpected nil exit", nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workerDone := make(chan error, 1)
+			workerDone <- test.workerErr
+			admissionStopped := false
+			storeClosed := false
+			err := superviseGateway(
+				context.Background(),
+				shutdownFunc(func(context.Context) error { admissionStopped = true; return nil }),
+				func() {},
+				workerDone,
+				make(chan error, 1),
+				closeFunc(func() error { storeClosed = true; return nil }),
+				discardLogger(),
+			)
+			if err == nil {
+				t.Fatal("gateway kept running with a dead delivery worker")
+			}
+			if test.workerErr != nil && !errors.Is(err, test.workerErr) {
+				t.Fatalf("error = %v, want wrapped %v", err, test.workerErr)
+			}
+			if !admissionStopped {
+				t.Fatal("admission server was not shut down")
+			}
+			if !storeClosed {
+				t.Fatal("inbox was not closed")
+			}
+		})
+	}
+}
+
+func TestSuperviseGatewayStillShutsDownCleanlyOnSignalAndServerClose(t *testing.T) {
+	tests := []struct {
+		name  string
+		drive func(cancel context.CancelFunc, listenDone chan error)
+	}{
+		{"signal", func(cancel context.CancelFunc, _ chan error) { cancel() }},
+		{"server closed", func(_ context.CancelFunc, listenDone chan error) { listenDone <- http.ErrServerClosed }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			listenDone := make(chan error, 1)
+			workerDone := make(chan error, 1)
+			cancelWorker := func() { workerDone <- nil }
+			test.drive(cancel, listenDone)
+			err := superviseGateway(
+				ctx,
+				shutdownFunc(func(context.Context) error { return nil }),
+				cancelWorker,
+				workerDone,
+				listenDone,
+				closeFunc(func() error { return nil }),
+				discardLogger(),
+			)
+			if err != nil {
+				t.Fatalf("clean shutdown returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunReceiptGCCollectsPeriodicallyUntilCancelled(t *testing.T) {
+	collector := &countingCollector{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runReceiptGC(ctx, collector, time.Millisecond, discardLogger())
+	}()
+
+	deadline := time.After(time.Second)
+	for collector.calls() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("receipt GC ran %d times, want at least 2", collector.calls())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("receipt GC did not stop on cancellation")
+	}
+}
+
+func TestRunReceiptGCKeepsRunningAfterCollectionErrors(t *testing.T) {
+	collector := &countingCollector{err: errors.New("transient collection failure")}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runReceiptGC(ctx, collector, time.Millisecond, discardLogger())
+	}()
+
+	deadline := time.After(time.Second)
+	for collector.calls() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("receipt GC stopped after an error: %d calls", collector.calls())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
+func TestLoadRuntimeConfigBoundsQuarantineAndGCSettings(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		values := validGatewayEnvironment("test-only-secret")
+		config, err := loadRuntimeConfig(func(name string) string { return values[name] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config.quarantineRetention != config.receiptRetention {
+			t.Fatalf("quarantine retention = %s, want receipt retention %s", config.quarantineRetention, config.receiptRetention)
+		}
+		if config.maxQuarantineEntries != defaultMaxQuarantineEntries {
+			t.Fatalf("max quarantine entries = %d", config.maxQuarantineEntries)
+		}
+		if config.gcInterval != defaultGCInterval {
+			t.Fatalf("gc interval = %s", config.gcInterval)
+		}
+	})
+	t.Run("overrides", func(t *testing.T) {
+		values := validGatewayEnvironment("test-only-secret")
+		values["TRACE_GATEWAY_QUARANTINE_RETENTION"] = "48h"
+		values["TRACE_GATEWAY_MAX_QUARANTINE_ENTRIES"] = "250"
+		values["TRACE_GATEWAY_GC_INTERVAL"] = "10m"
+		config, err := loadRuntimeConfig(func(name string) string { return values[name] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config.quarantineRetention != 48*time.Hour || config.maxQuarantineEntries != 250 || config.gcInterval != 10*time.Minute {
+			t.Fatalf("config = %+v", config)
+		}
+	})
+	for name, value := range map[string]string{
+		"TRACE_GATEWAY_QUARANTINE_RETENTION":   "-1h",
+		"TRACE_GATEWAY_MAX_QUARANTINE_ENTRIES": "0",
+		"TRACE_GATEWAY_GC_INTERVAL":            "never",
+	} {
+		t.Run("rejects invalid "+name, func(t *testing.T) {
+			values := validGatewayEnvironment("test-only-secret")
+			values[name] = value
+			if _, err := loadRuntimeConfig(func(n string) string { return values[n] }); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("error = %v, want validation for %s", err, name)
+			}
+		})
+	}
+}
+
+func TestReplayQuarantinedBatchesRequeuesFromClosedInbox(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbox.db")
+	store, err := inbox.Open(path, inbox.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, batchID := range []string{"batch-a", "batch-b"} {
+		payload := []byte(batchID)
+		digest := sha256.Sum256(payload)
+		if _, err := store.Accept(context.Background(), inbox.Envelope{
+			AccountID: "account-a", BatchID: batchID,
+			Payload: payload, PayloadSHA256: hex.EncodeToString(digest[:]),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkQuarantined(context.Background(), "account-a", batchID, "upstream_401", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := replayQuarantinedBatches(path, []string{"only-one-argument"}); err == nil {
+		t.Fatal("invalid arguments were accepted")
+	}
+	replayed, err := replayQuarantinedBatches(path, []string{"account-a", "batch-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed != 1 {
+		t.Fatalf("replayed = %d", replayed)
+	}
+	replayed, err = replayQuarantinedBatches(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed != 1 {
+		t.Fatalf("replayed remaining = %d", replayed)
+	}
+
+	store, err = inbox.Open(path, inbox.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	head, err := store.PeekEligible(context.Background(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head == nil || head.BatchID != "batch-a" {
+		t.Fatalf("head = %#v", head)
+	}
+}
+
+type countingCollector struct {
+	mu    sync.Mutex
+	count int
+	err   error
+}
+
+func (c *countingCollector) CollectReceipts(context.Context, time.Time) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.count++
+	return 1, c.err
+}
+
+func (c *countingCollector) calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.count
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func TestLangfuseUpstreamSendsProtobufAndReturnsOnlyDeliveryMetadata(t *testing.T) {

@@ -64,12 +64,19 @@ type StorageGuard interface {
 
 type Options struct {
 	ReceiptRetention time.Duration
-	MaxDBBytes       int64
-	MinFreeBytes     int64
-	AllocSize        int
-	OpenTimeout      time.Duration
-	Now              func() time.Time
-	StorageGuard     StorageGuard
+	// QuarantineRetention bounds how long a quarantined payload and its
+	// receipt are kept before collection. Zero selects ReceiptRetention.
+	QuarantineRetention time.Duration
+	// MaxQuarantineEntries caps stored quarantine payloads; collection evicts
+	// the oldest payloads above the cap while keeping their receipts for
+	// idempotency. Zero selects a bounded default.
+	MaxQuarantineEntries int
+	MaxDBBytes           int64
+	MinFreeBytes         int64
+	AllocSize            int
+	OpenTimeout          time.Duration
+	Now                  func() time.Time
+	StorageGuard         StorageGuard
 }
 
 type Store interface {

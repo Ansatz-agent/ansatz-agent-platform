@@ -416,6 +416,330 @@ func TestBoltStoreZeroDeliveryTimeUsesStoreClockForReceiptCollection(t *testing.
 	}
 }
 
+func TestBoltStoreDuplicateAcceptDoesNotFsync(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	syncs := 0
+	baseSync := store.syncFn
+	store.syncFn = func() error { syncs++; return baseSync() }
+	envelope := validEnvelope("account-a", "batch-a", []byte("protobuf"))
+
+	if _, err := store.Accept(context.Background(), envelope); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 1 {
+		t.Fatalf("syncs after first accept = %d", syncs)
+	}
+	duplicate, err := store.Accept(context.Background(), envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.Outcome != ReceiptDuplicate {
+		t.Fatalf("outcome = %q", duplicate.Outcome)
+	}
+	if syncs != 1 {
+		t.Fatalf("syncs after duplicate accept = %d", syncs)
+	}
+}
+
+func TestBoltStoreEmptyCollectionDoesNotFsync(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	syncs := 0
+	baseSync := store.syncFn
+	store.syncFn = func() error { syncs++; return baseSync() }
+
+	collected, err := store.CollectReceipts(context.Background(), testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 0 || syncs != 0 {
+		t.Fatalf("collected = %d, syncs = %d", collected, syncs)
+	}
+}
+
+func TestBoltStoreViewsDoNotBlockOnWriterMutexDuringSync(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	if _, err := store.Accept(context.Background(), validEnvelope("account-a", "batch-a", []byte("protobuf"))); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var block sync.Once
+	baseSync := store.syncFn
+	store.syncFn = func() error {
+		block.Do(func() {
+			close(entered)
+			<-release
+		})
+		return baseSync()
+	}
+	accepted := make(chan error, 1)
+	go func() {
+		_, err := store.Accept(context.Background(), validEnvelope("account-a", "batch-b", []byte("protobuf-b")))
+		accepted <- err
+	}()
+	<-entered
+
+	viewed := make(chan error, 1)
+	go func() {
+		if _, err := store.PeekEligible(context.Background(), testNow); err != nil {
+			viewed <- err
+			return
+		}
+		_, err := store.NextRetryAt(context.Background())
+		viewed <- err
+	}()
+	select {
+	case err := <-viewed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("view operations blocked behind the writer mutex during fsync")
+	}
+	close(release)
+	if err := <-accepted; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBoltStoreViewsReturnErrClosedAfterClose(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PeekEligible(context.Background(), testNow); !errors.Is(err, ErrClosed) {
+		t.Fatalf("PeekEligible error = %v", err)
+	}
+	if _, err := store.NextRetryAt(context.Background()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("NextRetryAt error = %v", err)
+	}
+}
+
+func TestBoltStoreCollectsExpiredQuarantineAcrossRestartWithoutTouchingPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbox.db")
+	store, err := Open(path, Options{
+		ReceiptRetention:    30 * 24 * time.Hour,
+		QuarantineRetention: 24 * time.Hour,
+		Now:                 func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	for _, batchID := range []string{"bad", "pending"} {
+		if _, err := store.Accept(context.Background(), validEnvelope("account-a", batchID, []byte(batchID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkQuarantined(context.Background(), "account-a", "bad", "upstream_400", testNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path, Options{
+		ReceiptRetention:    30 * 24 * time.Hour,
+		QuarantineRetention: 24 * time.Hour,
+		Now:                 func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	collected, err := store.CollectReceipts(context.Background(), testNow.Add(24*time.Hour-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 0 {
+		t.Fatalf("collected fresh quarantine = %d", collected)
+	}
+	collected, err = store.CollectReceipts(context.Background(), testNow.Add(24*time.Hour+time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 2 {
+		t.Fatalf("collected expired quarantine payload and receipt = %d", collected)
+	}
+	if got := countBucketEntries(t, store, quarantineBucket); got != 0 {
+		t.Fatalf("quarantine entries = %d", got)
+	}
+	if got := countCanonicalBatches(t, store); got != 1 {
+		t.Fatalf("pending batches = %d", got)
+	}
+	head, err := store.PeekEligible(context.Background(), testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head == nil || head.BatchID != "pending" {
+		t.Fatalf("pending head = %#v", head)
+	}
+	if _, err := store.Accept(context.Background(), validEnvelope("account-a", "pending", []byte("pending"))); err != nil {
+		t.Fatalf("pending receipt lost: %v", err)
+	}
+}
+
+func TestBoltStoreCapsQuarantinePayloadsWithoutDroppingReceipts(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "inbox.db"), Options{
+		ReceiptRetention:     30 * 24 * time.Hour,
+		MaxQuarantineEntries: 2,
+		Now:                  func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	for _, batchID := range []string{"q1", "q2", "q3"} {
+		if _, err := store.Accept(context.Background(), validEnvelope("account-a", batchID, []byte(batchID))); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkQuarantined(context.Background(), "account-a", batchID, "upstream_400", testNow); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	collected, err := store.CollectReceipts(context.Background(), testNow.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 1 {
+		t.Fatalf("evicted quarantine payloads = %d", collected)
+	}
+	if got := countBucketEntries(t, store, quarantineBucket); got != 2 {
+		t.Fatalf("quarantine entries = %d", got)
+	}
+	if got := countBucketEntries(t, store, receiptsBucket); got != 3 {
+		t.Fatalf("receipts = %d", got)
+	}
+	if err := store.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(quarantineBucket).Get([]byte("account-a\x00q1")) != nil {
+			return errors.New("oldest quarantine payload was not evicted")
+		}
+		for _, batchID := range []string{"q2", "q3"} {
+			if tx.Bucket(quarantineBucket).Get([]byte("account-a\x00"+batchID)) == nil {
+				return fmt.Errorf("newer quarantine payload %s was evicted", batchID)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Accept(context.Background(), validEnvelope("account-a", "q1", []byte("q1"))); err != nil {
+		t.Fatalf("evicted payload lost its idempotency receipt: %v", err)
+	}
+}
+
+func TestBoltStoreReplayQuarantinedRestoresFIFOWithIdempotentReceipt(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	envelope := validEnvelope("account-a", "bad", []byte("protobuf"))
+	if _, err := store.Accept(context.Background(), envelope); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkQuarantined(context.Background(), "account-a", "bad", "upstream_401", testNow); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.ReplayQuarantined(context.Background(), "account-a", "bad"); err != nil {
+		t.Fatal(err)
+	}
+	head, err := store.PeekEligible(context.Background(), testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head == nil || head.BatchID != "bad" || head.Attempts != 0 || head.LastError != "" || string(head.Payload) != "protobuf" {
+		t.Fatalf("replayed head = %#v", head)
+	}
+	if got := countBucketEntries(t, store, quarantineBucket); got != 0 {
+		t.Fatalf("quarantine entries = %d", got)
+	}
+	duplicate, err := store.Accept(context.Background(), envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.Outcome != ReceiptDuplicate {
+		t.Fatalf("replayed batch lost idempotency: outcome = %q", duplicate.Outcome)
+	}
+	if err := store.ReplayQuarantined(context.Background(), "account-a", "bad"); !errors.Is(err, ErrBatchNotFound) {
+		t.Fatalf("second replay error = %v", err)
+	}
+}
+
+func TestBoltStoreReplayAllQuarantinedPreservesOriginalOrder(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
+	for _, batchID := range []string{"q1", "q2"} {
+		if _, err := store.Accept(context.Background(), validEnvelope("account-a", batchID, []byte(batchID))); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkQuarantined(context.Background(), "account-a", batchID, "upstream_401", testNow); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	replayed, err := store.ReplayAllQuarantined(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed != 2 {
+		t.Fatalf("replayed = %d", replayed)
+	}
+	for _, want := range []string{"q1", "q2"} {
+		head, err := store.PeekEligible(context.Background(), testNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if head == nil || head.BatchID != want {
+			t.Fatalf("head = %#v, want %s", head, want)
+		}
+		if err := store.MarkDelivered(context.Background(), "account-a", want, testNow); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestBoltStoreSteadyStateDeliveredReceiptsAndQuarantineStayBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbox.db")
+	now := testNow
+	store, err := Open(path, Options{
+		ReceiptRetention:     time.Hour,
+		QuarantineRetention:  time.Hour,
+		MaxQuarantineEntries: 4,
+		Now:                  func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	const cycles = 40
+	var halfway int64
+	for i := range cycles {
+		deliveredID := fmt.Sprintf("delivered-%03d", i)
+		quarantinedID := fmt.Sprintf("quarantined-%03d", i)
+		if _, err := store.Accept(context.Background(), validEnvelope("account-a", deliveredID, []byte("payload"))); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkDelivered(context.Background(), "account-a", deliveredID, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Accept(context.Background(), validEnvelope("account-a", quarantinedID, []byte("payload"))); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkQuarantined(context.Background(), "account-a", quarantinedID, "upstream_400", now); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(2 * time.Hour)
+		if _, err := store.CollectReceipts(context.Background(), now); err != nil {
+			t.Fatal(err)
+		}
+		if i == cycles/2 {
+			halfway = fileSize(t, path)
+		}
+	}
+	if final := fileSize(t, path); final > halfway {
+		t.Fatalf("database kept growing at steady state: halfway = %d, final = %d", halfway, final)
+	}
+}
+
 func TestBoltStoreSyncFailurePreventsAcceptedOutcome(t *testing.T) {
 	store := openTestStore(t, filepath.Join(t.TempDir(), "inbox.db"))
 	want := errors.New("injected sync failure")
