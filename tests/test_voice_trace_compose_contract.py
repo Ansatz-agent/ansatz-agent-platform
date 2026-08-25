@@ -224,7 +224,8 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         for required in (
             "2 GiB per account",
             "30 days",
-            "64 MiB segment",
+            "64 MiB maximum encrypted record",
+            "single `active.segment` can grow to the 2 GiB per-account cap",
             "Brotli then AES-256-GCM",
             "greater of 1 GiB or 5%",
             "64 GiB bbolt ceiling",
@@ -235,11 +236,17 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
             "duplicate",
             "503 storage_unavailable",
             "Retry-After",
+            "Retry-After: 60",
             "application/x-protobuf",
             "key loss",
             "owner mismatch",
             "read-only diagnostics",
             "offline compaction",
+            "authoritative active-work counter",
+            "startup maintenance is asynchronous",
+            "idle transition triggers maintenance",
+            "one encrypted record at a time",
+            "duplicate receipt also wakes",
             "Sign out preserves data",
             "structured revocation pauses upload",
             "rollback",
@@ -247,6 +254,8 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, text)
         self.assertNotIn("507 storage_unavailable", text)
+        self.assertNotIn("64 MiB segment,", text)
+        self.assertNotIn("The application performs the supported compaction", text)
 
 
 if __name__ == "__main__":

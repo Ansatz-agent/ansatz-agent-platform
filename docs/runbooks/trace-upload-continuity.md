@@ -7,7 +7,10 @@ service environment files while following it.
 
 ## Storage contracts
 
-- Client: 2 GiB per account, 30 days, 64 MiB segment, Brotli then AES-256-GCM.
+- Client: 2 GiB per account, 30 days, 64 MiB maximum encrypted record,
+  Brotli then AES-256-GCM. Records append to one account-local file: the
+  single `active.segment` can grow to the 2 GiB per-account cap; 64 MiB is not
+  a segment-rotation target.
 - Client reserve: the greater of 1 GiB or 5% of the containing volume.
 - Client receipt tombstones are payload-free and bounded to 64 MiB, 100,000
   entries, and the same 30-day retention window.
@@ -19,11 +22,14 @@ service environment files while following it.
   either receipt is durably journaled, the client releases the corresponding
   payload; only the bounded receipt tombstone remains. A Gateway-first receipt
   cancels the competing local append, so a successful Trace/span payload is
-  not committed to the outbox.
+  not committed to the outbox. An accepted or duplicate receipt also wakes
+  the background delivery worker; this lets a repeated request wake a durable
+  batch whose earlier wakeup was lost.
 - `503 storage_unavailable` is retryable and does not transfer ownership. The
-  Gateway supplies `Retry-After` and an OTLP `application/x-protobuf`
-  response. The former insufficient-storage status in the implementation plan
-  is obsolete; operators must use this 503 contract.
+  Gateway supplies `Retry-After: 60` and an OTLP `application/x-protobuf`
+  response whose status code is `UNAVAILABLE` and message is
+  `storage_unavailable`. The former insufficient-storage status in the
+  implementation plan is obsolete; operators must use this 503 contract.
 
 The outbox capacity and retention limits apply independently to each account
 namespace. Quarantined payloads still consume that account's capacity. When
@@ -123,17 +129,47 @@ plaintext key and payload never belong in logs or diagnostics.
 - Unknown legacy ownership fails closed until a trusted owner can be bound.
 - A corrupt non-tail record or unsafe path is quarantined/fails closed. Only a
   verified torn tail is truncated during automatic crash recovery.
-- Compaction is automatic and runs only while conversation streaming is idle.
-  It rewrites live encrypted records to a synced replacement, atomically
-  replaces the segment, and then compacts the journal. Operators must not
-  manually compact a live client outbox.
+- The mixed-segment rewrite is guarded by the authoritative active-work counter
+  shared with the renderer quit/stream-throttle path. The
+  `isConversationStreaming` callback reads that counter before each bounded
+  record read and again before replacement; if a turn starts, maintenance
+  abandons the temporary file without replacing `active.segment`.
+- Compaction copies one encrypted record at a time into an empty temporary
+  file, syncs it, atomically replaces `active.segment`, and then compacts the
+  journal. It does not read or `Buffer.concat` the whole account segment in
+  memory. Fully terminal segment removal does not need to copy any live
+  record; mixed live/terminal rewriting happens only while the counter is
+  idle.
+- After the store opens, startup maintenance is asynchronous: the Desktop
+  schedules `compactIfIdle()` without making it a prerequisite for local
+  backend startup. An idle transition triggers maintenance: a renderer
+  active-work update or renderer destruction changes the merged count to zero
+  and invokes the maintenance hook. Receipt and capacity paths call this same
+  maintenance method; its mixed-segment rewrite observes the streaming gate.
 
-To perform safe offline compaction at the client level, quit Ansatz, verify no
-Ansatz process owns the selected account directory, make an owner-only backup
-of the complete directory on the same protected volume, and restart Ansatz.
-The application performs the supported compaction. If it cannot reopen the
-namespace, preserve both the original and backup and escalate; do not edit the
-journal or encrypted segment.
+### Safe client restart and offline compaction
+
+There is no supported operator command that edits or compacts a client
+outbox. Use this safe sequence:
+
+1. Finish or cancel the active turn. If the quit guard reports active work,
+   choose **Keep Running** and wait for the authoritative count to return to
+   zero; do not force-quit solely to compact.
+2. Quit Ansatz normally and verify the Ansatz process has exited. Do not edit,
+   rename, or open `key.json`, `index.journal`, or `active.segment`.
+3. Restart Ansatz. Opening the store performs crash recovery; startup then
+   schedules bounded compaction asynchronously, so local conversation startup
+   does not wait for a large rewrite.
+4. Leave the conversation idle. The startup attempt, or the next idle
+   transition if work resumed, rewrites one encrypted record at a time and
+   aborts safely if streaming starts.
+
+An owner-only copy of the complete, closed account directory is an optional
+incident-preservation prerequisite, not a compaction mechanism. Creating a
+backup does not compact anything, and restart only schedules maintenance; the
+streaming gate still decides whether replacement occurs. If the namespace
+cannot reopen, preserve the original and any backup and escalate instead of
+editing the journal or encrypted segment.
 
 ## Network, authentication, and token recovery
 
