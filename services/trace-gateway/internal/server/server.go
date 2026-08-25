@@ -21,12 +21,20 @@ import (
 	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/inbox"
 	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/otlp"
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	"google.golang.org/genproto/googleapis/rpc/code"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
 const (
-	defaultMaxBodyBytes = int64(8 * 1024 * 1024)
+	defaultMaxBodyBytes      = int64(8 * 1024 * 1024)
+	storageRetryAfterSeconds = "60"
 )
+
+var storageUnavailableBody = mustMarshalStatus(&statuspb.Status{
+	Code:    int32(code.Code_UNAVAILABLE),
+	Message: "storage_unavailable",
+})
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 var uuidV4Pattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
@@ -226,14 +234,14 @@ func (s *Server) serveTrace(w http.ResponseWriter, request *http.Request, now ti
 			return http.StatusConflict, len(body)
 		}
 		if errors.Is(err, inbox.ErrStorageUnavailable) {
-			writeError(w, http.StatusInsufficientStorage, "storage_unavailable")
-			return http.StatusInsufficientStorage, len(body)
+			writeStorageUnavailable(w)
+			return http.StatusServiceUnavailable, len(body)
 		}
-		writeError(w, http.StatusServiceUnavailable, "storage_unavailable")
+		writeStorageUnavailable(w)
 		return http.StatusServiceUnavailable, len(body)
 	}
 	if result.BatchID != headers.BatchID || (result.Outcome != inbox.ReceiptAccepted && result.Outcome != inbox.ReceiptDuplicate) {
-		writeError(w, http.StatusServiceUnavailable, "storage_unavailable")
+		writeStorageUnavailable(w)
 		return http.StatusServiceUnavailable, len(body)
 	}
 	if result.Outcome == inbox.ReceiptAccepted && s.trigger != nil {
@@ -335,6 +343,22 @@ func writeError(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
+}
+
+func writeStorageUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/x-protobuf")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Retry-After", storageRetryAfterSeconds)
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write(storageUnavailableBody)
+}
+
+func mustMarshalStatus(status *statuspb.Status) []byte {
+	body, err := proto.Marshal(status)
+	if err != nil {
+		panic("failed to marshal static OTLP status")
+	}
+	return body
 }
 
 func writeSuccess(w http.ResponseWriter, batchID string, outcome inbox.ReceiptOutcome) {

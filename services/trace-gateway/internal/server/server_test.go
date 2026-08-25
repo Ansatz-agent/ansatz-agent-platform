@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -20,6 +21,8 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/genproto/googleapis/rpc/code"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -201,7 +204,6 @@ func TestHandlerRejectsInvalidContractsWithFixedNoStoreErrors(t *testing.T) {
 			return r
 		}, 409, "payload_digest_mismatch"},
 		{"idempotency conflict", Config{Introspector: fakeIntrospector{}, Store: &recordingStore{err: inbox.ErrIdempotencyConflict}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 409, "idempotency_conflict"},
-		{"storage unavailable", Config{Introspector: fakeIntrospector{}, Store: &recordingStore{err: inbox.ErrStorageUnavailable}}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 507, "storage_unavailable"},
 		{"refresh required", Config{Introspector: fakeIntrospector{err: &auth.InactiveError{Code: "trace_token_refresh_required"}}, Store: acceptedStore()}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 401, "trace_token_refresh_required"},
 		{"auth unavailable", Config{Introspector: fakeIntrospector{err: auth.ErrUnavailable}, Store: acceptedStore()}, func(t *testing.T) *http.Request { return validRequest(validBody(t)) }, 503, "authentication_unavailable"},
 		{"too large", Config{Introspector: fakeIntrospector{}, Store: acceptedStore(), MaxBodyBytes: 32}, func(t *testing.T) *http.Request { return validRequest(bytes.Repeat([]byte("x"), 33)) }, 413, "payload_too_large"},
@@ -226,6 +228,54 @@ func TestHandlerRejectsInvalidContractsWithFixedNoStoreErrors(t *testing.T) {
 			}
 			if bytes.Contains(response.Body.Bytes(), []byte(uploadBearer)) {
 				t.Fatal("bearer leaked in error")
+			}
+		})
+	}
+}
+
+func TestHandlerReturnsRetryableOtlpUnavailableBeforeDurableAcceptance(t *testing.T) {
+	tests := []struct {
+		name  string
+		store *recordingStore
+	}{
+		{"capacity guard", &recordingStore{err: inbox.ErrStorageUnavailable}},
+		{"durability failure", &recordingStore{err: errors.New("sync failed")}},
+		{"invalid durable result", &recordingStore{result: inbox.AcceptResult{BatchID: batchID}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			triggered := false
+			requestBody := validBody(t)
+			response := httptest.NewRecorder()
+			mustHandler(t, Config{
+				Introspector: fakeIntrospector{},
+				Store:        test.store,
+				Trigger:      func() { triggered = true },
+			}).ServeHTTP(response, validRequest(requestBody))
+
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body=%x", response.Code, response.Body.Bytes())
+			}
+			if response.Header().Get("Content-Type") != "application/x-protobuf" ||
+				response.Header().Get("Cache-Control") != "no-store" ||
+				response.Header().Get("Retry-After") != "60" {
+				t.Fatalf("headers = %v", response.Header())
+			}
+			if response.Header().Get("X-Trace-Receipt") != "" || response.Header().Get("X-Trace-Batch-ID") != "" {
+				t.Fatalf("non-durable response exposed receipt headers: %v", response.Header())
+			}
+			var status statuspb.Status
+			if err := proto.Unmarshal(response.Body.Bytes(), &status); err != nil {
+				t.Fatalf("OTLP status body: %v; bytes=%x", err, response.Body.Bytes())
+			}
+			if status.Code != int32(code.Code_UNAVAILABLE) || status.Message != "storage_unavailable" || len(status.Details) != 0 {
+				t.Fatalf("status body = %#v", &status)
+			}
+			if bytes.Contains(response.Body.Bytes(), []byte(uploadBearer)) || bytes.Contains(response.Body.Bytes(), requestBody) {
+				t.Fatal("credential or Trace payload leaked in storage response")
+			}
+			if triggered {
+				t.Fatal("non-durable batch triggered delivery")
 			}
 		})
 	}
