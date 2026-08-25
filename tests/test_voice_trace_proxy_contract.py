@@ -53,5 +53,28 @@ class VoiceTraceProxyContractTest(unittest.TestCase):
     def test_legacy_agent_proxy_fragment_is_removed(self) -> None:
         self.assertFalse((NGINX / "c2sml.cn-agent.conf").exists())
 
+    def test_native_session_routes_forward_bearer_without_exposing_it_to_legacy_auth(self) -> None:
+        source = self.read("server_proxy.conf")
+        broad_auth_start = source.index("location ^~ /auth/ {")
+        broad_auth_end = source.index("\n}\n", broad_auth_start)
+        broad_auth = source[broad_auth_start:broad_auth_end]
+        self.assertIn('proxy_set_header Authorization ""', broad_auth)
+
+        for route in (
+            "/auth/api/client-session/",
+            "/auth/api/client-session/current/",
+            "/auth/api/client-session/trace-token/",
+        ):
+            marker = f"location = {route}"
+            self.assertIn(marker, source)
+            start = source.index(marker)
+            end = source.index("\n}\n", start)
+            block = source[start:end]
+            self.assertIn("proxy_set_header Authorization $http_authorization", block)
+            self.assertIn(
+                "proxy_set_header X-Ansatz-Installation-ID $http_x_ansatz_installation_id",
+                block,
+            )
+
 if __name__ == "__main__":
     unittest.main()

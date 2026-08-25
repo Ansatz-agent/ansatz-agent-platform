@@ -38,7 +38,7 @@ func (f fakeIntrospector) Introspect(_ context.Context, _ string) (auth.Principa
 		TokenID:        "token-id",
 		AccountID:      "22222222-2222-4222-8222-222222222222",
 		SessionID:      "33333333-3333-4333-8333-333333333333",
-		UserID:         "mutable-display-id",
+		UserID:         "42",
 		Username:       "yiyuxiao",
 		InstallationID: "44444444-4444-4444-8444-444444444444",
 		ExpiresAt:      time.Now().Add(time.Hour),
@@ -134,11 +134,12 @@ func TestHandlerStoresCanonicalBatchUnderImmutableAccountIdentity(t *testing.T) 
 		t.Fatal(err)
 	}
 	attributes := exported.ResourceSpans[0].Resource.Attributes
-	assertAttribute(t, attributes, "platform.user.id", envelope.AccountID)
-	assertAttribute(t, attributes, "user.id", envelope.AccountID)
-	assertAttribute(t, attributes, "langfuse.user.id", envelope.AccountID)
+	assertAttribute(t, attributes, "platform.user.id", "42")
+	assertAttribute(t, attributes, "ansatz.account.id", envelope.AccountID)
+	assertAttribute(t, attributes, "user.id", "yiyuxiao")
+	assertAttribute(t, attributes, "langfuse.user.id", "yiyuxiao")
 	assertAttribute(t, attributes, "trace.gateway.batch.id", batchID)
-	if got := exported.String(); strings.Contains(got, "mutable-display-id") || strings.Contains(got, "request-id") {
+	if got := exported.String(); strings.Contains(got, "request-id") {
 		t.Fatalf("mutable or request identity reached canonical payload: %s", got)
 	}
 }
