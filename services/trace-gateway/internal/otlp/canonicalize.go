@@ -21,6 +21,7 @@ type Headers struct {
 
 var canonicalKeys = map[string]struct{}{
 	"platform.user.id":                   {},
+	"ansatz.account.id":                  {},
 	"user.id":                            {},
 	"langfuse.user.id":                   {},
 	"client.installation.id":             {},
@@ -49,7 +50,7 @@ func Canonicalize(
 	headers Headers,
 	batchID string,
 ) error {
-	if request == nil || principal.AccountID == "" || principal.Username == "" || principal.InstallationID == "" ||
+	if request == nil || principal.AccountID == "" || principal.UserID == "" || principal.Username == "" || principal.InstallationID == "" ||
 		headers.SessionID == "" || headers.Entrypoint == "" || headers.RunID == "" ||
 		headers.SchemaVersion != "1" || batchID == "" {
 		return errors.New("invalid canonical identity")
@@ -77,8 +78,8 @@ func Canonicalize(
 				span.Attributes = projectRelayForLangfuse(span.Name, span.Attributes)
 				span.Attributes = append(
 					span.Attributes,
-					stringAttribute("user.id", principal.AccountID),
-					stringAttribute("langfuse.user.id", principal.AccountID),
+					stringAttribute("user.id", principal.Username),
+					stringAttribute("langfuse.user.id", principal.Username),
 					stringAttribute("langfuse.trace.metadata.username", principal.Username),
 					stringAttribute("session.id", headers.SessionID),
 					stringAttribute("langfuse.session.id", headers.SessionID),
@@ -98,9 +99,10 @@ func Canonicalize(
 		}
 		resourceSpans.Resource.Attributes = append(
 			resourceSpans.Resource.Attributes,
-			stringAttribute("platform.user.id", principal.AccountID),
-			stringAttribute("user.id", principal.AccountID),
-			stringAttribute("langfuse.user.id", principal.AccountID),
+			stringAttribute("platform.user.id", principal.UserID),
+			stringAttribute("ansatz.account.id", principal.AccountID),
+			stringAttribute("user.id", principal.Username),
+			stringAttribute("langfuse.user.id", principal.Username),
 			stringAttribute("langfuse.trace.metadata.username", principal.Username),
 			stringAttribute("client.installation.id", principal.InstallationID),
 			stringAttribute("hermes.session.id", headers.SessionID),
