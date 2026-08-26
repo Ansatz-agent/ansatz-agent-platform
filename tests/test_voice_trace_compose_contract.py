@@ -165,6 +165,15 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         self.assertNotIn("LANGFUSE_INIT_USER_PASSWORD", gateway_env)
         self.assertNotIn("Basic ", source)
 
+    def test_auth_healthcheck_is_a_single_shell_command(self) -> None:
+        _, compose = self.load_compose()
+        healthcheck = compose["services"]["auth-service"]["healthcheck"]
+
+        self.assertEqual(healthcheck["test"][0], "CMD-SHELL")
+        self.assertEqual(len(healthcheck["test"]), 2)
+        self.assertIn("python -c", healthcheck["test"][1])
+        self.assertIn("/healthz", healthcheck["test"][1])
+
     def test_trace_gateway_has_private_durable_inbox_and_exact_safety_limits(self) -> None:
         _, compose = self.load_compose()
         gateway = compose["services"]["trace-gateway"]
