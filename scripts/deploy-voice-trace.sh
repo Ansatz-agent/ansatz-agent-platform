@@ -32,8 +32,10 @@ rtk proxy ssh "$REMOTE_HOST" "install -d -m 0700 '$REMOTE_ROOT' '$REMOTE_ROOT/de
 rtk proxy ssh "$REMOTE_HOST" "install -d -m 0700 -o 999 -g 999 '$REMOTE_ROOT/data/postgres' '$REMOTE_ROOT/data/redis'"
 rtk proxy ssh "$REMOTE_HOST" "install -d -m 0700 -o 101 -g 101 '$REMOTE_ROOT/data/clickhouse' '$REMOTE_ROOT/data/clickhouse-logs'"
 rtk proxy ssh "$REMOTE_HOST" "install -d -m 0700 -o 65532 -g 65532 '$REMOTE_ROOT/data/minio'"
+rtk proxy ssh "$REMOTE_HOST" "install -d -m 0755 '$REMOTE_ROOT/deploy/clickhouse/config.d' '$REMOTE_ROOT/deploy/clickhouse/users.d'"
 
 rtk proxy scp -r "$PLATFORM_ROOT/deploy/voice-trace/." "$REMOTE_HOST:$REMOTE_ROOT/deploy/"
+rtk proxy ssh "$REMOTE_HOST" "chmod 0644 '$REMOTE_ROOT/deploy/clickhouse/config.d/logging.xml' '$REMOTE_ROOT/deploy/clickhouse/users.d/profilers.xml'"
 rtk proxy scp "$SERVER_ENV" "$REMOTE_HOST:$REMOTE_ROOT/secrets/server.env"
 rtk proxy scp "$ADMIN_FILE" "$REMOTE_HOST:$REMOTE_ROOT/secrets/langfuse-admin.txt"
 remote_archive="$REMOTE_ROOT/staging/ansatz-auth-traces-images-20260824.tar.gz"

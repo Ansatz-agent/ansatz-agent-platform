@@ -1,6 +1,6 @@
 # Hermes Storage, Auth, and Personal Traces Runbook
 
-Last verified: **2026-08-24**
+Last verified: **2026-08-26**
 
 This runbook operates the production Voice Trace stack on SSH alias `hermes`. It does not cover the unrelated `cv-php8`/single-cv or Nginx Proxy Manager applications except for read-only health verification.
 
@@ -36,6 +36,53 @@ The check requires all eight platform containers to run without host-published p
 Administrators sign in separately at `/langfuse` with a Langfuse administrator account. Ordinary users sign in at `/auth` and access only `/traces`; the two account systems are intentionally not joined by SSO in this rollout.
 
 `cv-php8` and `npm` are separate running services. Never stop, remove, recreate, prune, or change their images, mounts, external build containers, or networks as part of Voice Trace work.
+
+## ClickHouse diagnostic-log retention
+
+The Voice Trace ClickHouse instance uses repository-owned fragments under
+`deploy/voice-trace/clickhouse/`. File logging is limited to warning level,
+100 MiB per file and three rotations. High-volume diagnostic system logs that
+Langfuse does not consume are disabled, including `metric_log`, `trace_log`,
+`text_log`, and profiler-related logs. Query, part, and error logs remain
+available with a seven-day TTL. Query, CPU, and memory profilers are disabled
+for the default profile.
+
+This is a Langfuse/ClickHouse observability-stack responsibility, not an auth
+service responsibility. A repeating `system.metric_log` merge that reaches the
+ClickHouse server memory limit can emit warning/trace records into both file
+logs and `system.trace_log`; unrestricted trace-level rotation and memory
+profiling then amplify the storage growth.
+
+Apply the bounded remediation from the platform repository:
+
+```bash
+bash scripts/remediate-clickhouse-logging.sh
+```
+
+The helper backs up the prior Compose, deployed fragments, and any fragments
+already present in the live container, records
+business-table row/byte evidence, validates the rendered Compose without
+printing secrets, and restarts
+`ansatz-voice-trace-20260823_clickhouse_1` in place. Hermes Podman 3.3.1 does
+not permit removing that container while its Langfuse dependents exist, so the
+helper copies the reviewed fragments into the stopped container and preserves
+every container ID. The repository Compose retains read-only fragment mounts
+for a future full-stack deployment. While the exact ClickHouse container is
+stopped, the helper deletes only `clickhouse-server.log*` and
+`clickhouse-server.err.log*` beneath the Voice Trace log directory. After
+restart it truncates only the explicitly disabled `system.*` log tables,
+retrofitting seven-day TTLs on retained operational logs. It then proves that
+all other host container IDs did not change, the canonical `events_core FINAL`
+row count did not decrease, no pre-existing business table disappeared,
+profiler settings are zero, disabled logs remain empty, 30-second file growth
+is bounded, and the full Voice Trace health check passes.
+
+On failure the helper restores the previous Compose/fragments and recreates
+the exact ClickHouse container. Diagnostic rows and old file logs removed by a
+successful run are intentionally unrecoverable; Langfuse business tables and
+all authentication data remain out of the cleanup whitelist. Never substitute
+a global Podman prune, a database drop, or direct deletion below
+`data/clickhouse`.
 
 ## Deploy tested images
 

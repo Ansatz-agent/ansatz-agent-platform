@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import yaml
@@ -10,6 +11,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_PATH = ROOT / "deploy" / "voice-trace" / "docker-compose.yml"
 ENV_EXAMPLE_PATH = ROOT / "deploy" / "voice-trace" / ".env.example"
+CLICKHOUSE_SERVER_CONFIG_PATH = (
+    ROOT / "deploy" / "voice-trace" / "clickhouse" / "config.d" / "logging.xml"
+)
+CLICKHOUSE_USER_CONFIG_PATH = (
+    ROOT / "deploy" / "voice-trace" / "clickhouse" / "users.d" / "profilers.xml"
+)
 
 
 class VoiceTraceComposeContractTest(unittest.TestCase):
@@ -187,10 +194,63 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
             compose["services"]["auth-service"]["volumes"],
             ["/data/ansatz-agent/voice-trace/data/auth:/data"],
         )
-        for name in ("auth-service", "postgres", "clickhouse", "redis", "minio"):
+        for name in ("auth-service", "postgres", "redis", "minio"):
             for mount in compose["services"][name].get("volumes", []):
                 source = mount.split(":", 1)[0]
                 self.assertTrue(source.startswith("/data/ansatz-agent/voice-trace/data/"), source)
+
+    def test_clickhouse_logging_is_bounded_and_unused_system_logs_are_disabled(self) -> None:
+        _, compose = self.load_compose()
+        self.assertTrue(CLICKHOUSE_SERVER_CONFIG_PATH.is_file())
+        self.assertTrue(CLICKHOUSE_USER_CONFIG_PATH.is_file())
+
+        clickhouse = compose["services"]["clickhouse"]
+        self.assertEqual(
+            clickhouse["volumes"],
+            [
+                "/data/ansatz-agent/voice-trace/data/clickhouse:/var/lib/clickhouse",
+                "/data/ansatz-agent/voice-trace/data/clickhouse-logs:/var/log/clickhouse-server",
+                "/data/ansatz-agent/voice-trace/deploy/clickhouse/config.d/logging.xml:/etc/clickhouse-server/config.d/logging.xml:ro",
+                "/data/ansatz-agent/voice-trace/deploy/clickhouse/users.d/profilers.xml:/etc/clickhouse-server/users.d/profilers.xml:ro",
+            ],
+        )
+
+        server_root = ET.parse(CLICKHOUSE_SERVER_CONFIG_PATH).getroot()
+        self.assertEqual(server_root.findtext("logger/level"), "warning")
+        self.assertEqual(server_root.findtext("logger/size"), "100M")
+        self.assertEqual(server_root.findtext("logger/count"), "3")
+        self.assertEqual(server_root.findtext("total_memory_profiler_step"), "0")
+        for name in (
+            "metric_log",
+            "trace_log",
+            "text_log",
+            "asynchronous_metric_log",
+            "opentelemetry_span_log",
+            "processors_profile_log",
+            "query_metric_log",
+            "background_schedule_pool_log",
+        ):
+            with self.subTest(system_log=name):
+                self.assertEqual(server_root.find(name).get("remove"), "1")
+        for name in ("query_log", "part_log", "error_log"):
+            with self.subTest(retained_log=name):
+                self.assertEqual(
+                    server_root.findtext(f"{name}/ttl"),
+                    "event_date + INTERVAL 7 DAY DELETE",
+                )
+
+        user_root = ET.parse(CLICKHOUSE_USER_CONFIG_PATH).getroot()
+        for setting in (
+            "query_profiler_real_time_period_ns",
+            "query_profiler_cpu_time_period_ns",
+            "memory_profiler_step",
+        ):
+            with self.subTest(profile_setting=setting):
+                self.assertEqual(user_root.findtext(f"profiles/default/{setting}"), "0")
+
+        combined = CLICKHOUSE_SERVER_CONFIG_PATH.read_text() + CLICKHOUSE_USER_CONFIG_PATH.read_text()
+        for forbidden in ("password", "secret", "CLICKHOUSE_PASSWORD"):
+            self.assertNotIn(forbidden, combined.lower())
 
     def test_minio_creates_the_langfuse_bucket_before_serving(self) -> None:
         _, compose = self.load_compose()
