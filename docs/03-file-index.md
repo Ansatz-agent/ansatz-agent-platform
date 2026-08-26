@@ -1,6 +1,6 @@
 # Ansatz-agent-platform 文件索引
 
-最后核对：**2026-08-25**
+最后核对：**2026-08-27**
 
 本文件只维护权威文档和实现入口。当前状态见 [`02-progress.md`](02-progress.md)。
 
@@ -37,6 +37,10 @@
 | 既有存储/认证/个人 Trace 设计 | [`superpowers/specs/2026-08-24-storage-auth-personal-traces-design.md`](superpowers/specs/2026-08-24-storage-auth-personal-traces-design.md) |
 | 既有安装、登录与 Voice Trace 计划 | [`superpowers/plans/2026-08-23-install-login-voice-tracing.md`](superpowers/plans/2026-08-23-install-login-voice-tracing.md) |
 | 既有存储/认证/个人 Trace 计划 | [`superpowers/plans/2026-08-24-storage-auth-personal-traces.md`](superpowers/plans/2026-08-24-storage-auth-personal-traces.md) |
+| Content-first Trace Explorer 设计 | [`superpowers/specs/2026-08-26-content-first-agent-trace-explorer-design.md`](superpowers/specs/2026-08-26-content-first-agent-trace-explorer-design.md) |
+| Content-first Trace Explorer 计划 | [`superpowers/plans/2026-08-26-content-first-agent-trace-explorer.md`](superpowers/plans/2026-08-26-content-first-agent-trace-explorer.md) |
+| Session-first Trace Inspector 设计 | [`superpowers/specs/2026-08-27-session-first-trace-inspector-design.md`](superpowers/specs/2026-08-27-session-first-trace-inspector-design.md) |
+| Session-first Trace Inspector 计划 | [`superpowers/plans/2026-08-27-session-first-trace-inspector.md`](superpowers/plans/2026-08-27-session-first-trace-inspector.md) |
 
 历史部署状态不能替代 2026-08-25 连续性分支的交付状态；新报告也不能反向证明既有生产已经运行新代码。
 
@@ -50,6 +54,7 @@
 | 客户端 Trace forward/recovery | `../agent-hermes-client/apps/desktop/electron/trace-forwarder.ts`、`trace-recovery-controller.ts`、`trace-runtime-startup.ts` |
 | 客户端最终接线 | `../agent-hermes-client/apps/desktop/electron/main.ts` |
 | 服务端 Session/撤销/Trace token | `../agent-langfuse-server/auth-service/history/client_sessions.py`、`trace_tokens.py`、`auth_views.py` |
+| 个人 Dashboard 与 Trace Explorer | `../agent-langfuse-server/auth-service/history/trace_analytics.py`、`trace_views.py`、`templates/traces/` |
 | Gateway durable inbox | `services/trace-gateway/internal/inbox/` |
 | Gateway admission/delivery | `services/trace-gateway/internal/server/`、`services/trace-gateway/internal/delivery/` |
 | Gateway Compose limits | `deploy/voice-trace/docker-compose.yml` |
