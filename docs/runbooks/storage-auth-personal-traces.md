@@ -92,7 +92,7 @@ Build auth and Gateway images on the task-scoped L40S directory, run their full 
 
 Current tested release:
 
-- Auth: `localhost/ansatz-auth-service:auth-traces-20260824-r2`; archive SHA-256 `26baeb00b7cdda0ba4d54c8bea205062bf86f6eea134f843e5b24f9bd4df9cd6`
+- Auth: `localhost/ansatz-auth-service:main-20260827-01c73ca1ad`; archive SHA-256 `54e641af2bba1418ea76c3512cf09bd7777e5c7da3dd23d4e53fe7014b2fb399`
 - Trace Gateway: `localhost/ansatz-trace-gateway:auth-traces-20260824-r2`; archive SHA-256 `304c813b6c8811be9b5bcd83401de261a1c401034e207bc680f61d3cdec00350`
 
 Before recreation:

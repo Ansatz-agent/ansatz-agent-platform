@@ -1,21 +1,21 @@
 # Ansatz-agent-platform 当前进展
 
-最后更新：**2026-08-26**
+最后更新：**2026-08-27**
 
 本文件只维护当前阶段、里程碑、下一步和边界；详细证据链接到专项报告。
 
 ## 当前阶段
 
-**阶段：认证连续性与 Trace 离线补传已完成本地实现、独立审查和最终验证，等待 Git 交付、安装包与部署授权。**
+**阶段：个人 Trace Explorer 已完成生产发布；认证连续性与 Trace 离线补传仍按专项报告中的边界等待后续发布。**
 
 Hermes 上 Voice Trace ClickHouse 的诊断日志失控已完成生产修复：文件日志降为 warning 并限制为 100 MiB × 3，内存/CPU/查询 profiler 关闭，Langfuse 不消费的高量 `system.*` 日志关闭并清空，保留日志设置七天 TTL。认证服务、其他 Voice Trace 容器以及主机上的其他容器均未重建。
 
-普通用户个人分析页已部署到 Hermes：服务端远端与本地 `main` 均为
-`aa4278d2703fffe40b75eb69a144fcc98d36bb1c`，生产镜像为
-`localhost/ansatz-auth-service:main-20260826-aa4278d270`，镜像 ID 为
-`5efa475e81828c2f89e79e9db9ef3c7720e49a651f803f7d84253b0ae10a2d17`。`/traces/`
-Dashboard 与 `/traces/models/` Model Analytics 已用生产账号的真实 owner-scoped 数据完成
-HTTP 200 渲染验收；全栈私网/公网健康检查通过。
+普通用户个人分析页与 session-first Trace Explorer 已部署到 Hermes：服务端远端与本地
+`main` 均为 `01c73ca1ad3ca61ee67129fd2304ad49d0778018`，生产镜像为
+`localhost/ansatz-auth-service:main-20260827-01c73ca1ad`，镜像 ID 为
+`4b45d69aca97042d9e6b531308d9a6dbf5b9d3721b671a57ab85f519d0193c0d`。生产账号的
+30 天 session 索引、session 详情和 trace 详情均完成真实 owner-scoped 数据验收；32 万字符级
+step 的完整 Input 被限制在 420 px 内部滚动区，整页高度保持 981 px；全栈私网/公网健康检查通过。
 
 客户端、认证服务与 Trace Gateway 的本地开发分支已实现并验证：认证服务暂时不可用时保持既有登录和本地对话能力；客户端重启可先从受保护缓存恢复；只有 Sign out 或可信且身份匹配的结构化撤销停止能力；Trace token 不再阻塞本地 Hermes；未上传 Trace 进入加密持久 outbox，恢复后 FIFO 补传；Gateway 在持久接收后才返回幂等 receipt。
 
@@ -31,6 +31,7 @@ HTTP 200 渲染验收；全栈私网/公网健康检查通过。
 | `M-012` | 认证连续性与 Trace 离线补传 | Done | 本地三仓实现与自动化验证完成；见 [`reports/2026-08-25-auth-trace-continuity-e2e.md`](reports/2026-08-25-auth-trace-continuity-e2e.md) |
 | `M-013` | Hermes ClickHouse 日志失控修复 | Done | 生产证据：`/data/ansatz-agent/voice-trace/evidence/clickhouse-logging-20260826T052311Z`；运维入口见 [`runbooks/storage-auth-personal-traces.md`](runbooks/storage-auth-personal-traces.md) |
 | `M-014` | 普通用户 Dashboard 与 Model Analytics | Done | 服务端 `main@aa4278d270` 已部署；生产真实账号 Dashboard/Model Analytics 均返回 200 |
+| `M-015` | Session-first Trace Explorer | Done | PR #7 与 #8 已合并；服务端 `main@01c73ca1ad`、生产镜像 `main-20260827-01c73ca1ad`；真实长 payload 生产验收通过 |
 
 ## 当前已确认设计
 
