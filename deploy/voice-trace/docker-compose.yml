@@ -157,6 +157,8 @@ services:
     volumes:
       - "${DEPLOY_ROOT}/data/clickhouse:/var/lib/clickhouse"
       - "${DEPLOY_ROOT}/data/clickhouse-logs:/var/log/clickhouse-server"
+      - "${DEPLOY_ROOT}/deploy/clickhouse/config.d/logging.xml:/etc/clickhouse-server/config.d/logging.xml:ro"
+      - "${DEPLOY_ROOT}/deploy/clickhouse/users.d/profilers.xml:/etc/clickhouse-server/users.d/profilers.xml:ro"
     networks:
       - service
     healthcheck:

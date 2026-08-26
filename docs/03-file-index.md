@@ -53,6 +53,8 @@
 | Gateway durable inbox | `services/trace-gateway/internal/inbox/` |
 | Gateway admission/delivery | `services/trace-gateway/internal/server/`、`services/trace-gateway/internal/delivery/` |
 | Gateway Compose limits | `deploy/voice-trace/docker-compose.yml` |
+| ClickHouse log/profiler retention | `deploy/voice-trace/clickhouse/` |
+| Hermes ClickHouse bounded remediation | `scripts/remediate-clickhouse-logging.sh`、`runbooks/storage-auth-personal-traces.md` |
 
 ## 按任务阅读
 

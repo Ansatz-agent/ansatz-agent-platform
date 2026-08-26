@@ -9,7 +9,7 @@ COMPOSE_FILE="$REMOTE_ROOT/deploy/docker-compose.yml"
 ENV_FILE="$REMOTE_ROOT/secrets/server.env"
 services=(auth-service trace-gateway langfuse-web langfuse-worker postgres clickhouse redis minio)
 
-rtk proxy ssh "$REMOTE_HOST" "cd '$REMOTE_ROOT' && /usr/bin/podman-compose --env-file '$ENV_FILE' -f '$COMPOSE_FILE' -p '$COMPOSE_PROJECT' ps"
+rtk proxy ssh "$REMOTE_HOST" "podman ps -a --format '{{.Names}}\t{{.Status}}' | awk '\$1 ~ /^${COMPOSE_PROJECT}_/' | sort"
 
 wait_remote() {
   local label="$1"

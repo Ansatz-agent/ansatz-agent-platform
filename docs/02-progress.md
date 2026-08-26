@@ -1,12 +1,14 @@
 # Ansatz-agent-platform 当前进展
 
-最后更新：**2026-08-25**
+最后更新：**2026-08-26**
 
 本文件只维护当前阶段、里程碑、下一步和边界；详细证据链接到专项报告。
 
 ## 当前阶段
 
 **阶段：认证连续性与 Trace 离线补传已完成本地实现、独立审查和最终验证，等待 Git 交付、安装包与部署授权。**
+
+Hermes 上 Voice Trace ClickHouse 的诊断日志失控已完成生产修复：文件日志降为 warning 并限制为 100 MiB × 3，内存/CPU/查询 profiler 关闭，Langfuse 不消费的高量 `system.*` 日志关闭并清空，保留日志设置七天 TTL。认证服务、其他 Voice Trace 容器以及主机上的其他容器均未重建。
 
 客户端、认证服务与 Trace Gateway 的本地开发分支已实现并验证：认证服务暂时不可用时保持既有登录和本地对话能力；客户端重启可先从受保护缓存恢复；只有 Sign out 或可信且身份匹配的结构化撤销停止能力；Trace token 不再阻塞本地 Hermes；未上传 Trace 进入加密持久 outbox，恢复后 FIFO 补传；Gateway 在持久接收后才返回幂等 receipt。
 
@@ -20,6 +22,7 @@
 | `M-009` | 多 Hermes 客户端认证与个人 Trace 接入 | Review | 既有部署状态与真实对话验收仍由历史报告维护 |
 | `M-011` | `/data`、`/auth`、个人 `/traces` 与独立 `/langfuse` | Review | 既有生产部署，不等同于本轮连续性代码已发布 |
 | `M-012` | 认证连续性与 Trace 离线补传 | Done | 本地三仓实现与自动化验证完成；见 [`reports/2026-08-25-auth-trace-continuity-e2e.md`](reports/2026-08-25-auth-trace-continuity-e2e.md) |
+| `M-013` | Hermes ClickHouse 日志失控修复 | Done | 生产证据：`/data/ansatz-agent/voice-trace/evidence/clickhouse-logging-20260826T052311Z`；运维入口见 [`runbooks/storage-auth-personal-traces.md`](runbooks/storage-auth-personal-traces.md) |
 
 ## 当前已确认设计
 
@@ -36,6 +39,7 @@
 1. 三仓最终 diff/secret 独立审阅与本地验证已经完成；交付使用报告中记录的精确 refs。
 2. 只有获得单独授权后，才 push 分支、创建 PR、合并、构建安装包或部署。
 3. 发布阶段另做 packaged macOS/Windows 与 staging/production acceptance；不得把当前本地 Playwright/Go harness 描述成 Windows 或生产运行时验证。
+4. 持续观察 Hermes ClickHouse 日志与 `/data` 使用率；复用 `scripts/remediate-clickhouse-logging.sh` 时必须保持其 Compose 基线、业务表和全主机容器 ID 保护门槛。
 
 ## 已知边界
 
@@ -43,6 +47,7 @@
 - 没有完成 live Windows packaged-runtime 验收；现有 Windows 证据限于代码级、路径级和静态/自动化测试。
 - 本地 Playwright 使用受控服务，Gateway E2E 使用临时 bbolt/HTTP harness；它们证明代码契约，不证明公网或生产拓扑。
 - 三入口统一上传、真实新安装包对话、历史 Token/Cost 等既有事项不因本轮连续性实现自动关闭。
+- Podman 3.3.1 原地启动 ClickHouse 时会输出“transient timer unit already exists”，但 SQL 探活及全部 Voice Trace 私网/公网健康检查通过；不要把该 stderr 单独当作服务失败。
 
 ## 状态更新规则
 
