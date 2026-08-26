@@ -84,7 +84,7 @@ Production schema inspection found 284 current observations comprising `SPAN` an
 
 | Analytics concept | Langfuse observation source | Rule |
 | --- | --- | --- |
-| Owner | `userId` | Must equal `str(request.user.pk)` after both upstream and local filtering. |
+| Owner | `userId` | Must equal the authenticated Django username after both upstream and local filtering, matching the production Gateway's canonical Langfuse projection. |
 | Session / trace | `sessionId`, `traceId`, `traceName` | Missing session falls back to a stable per-trace key. |
 | Time / active day | `startTime`, `endTime` | Invalid timestamps are excluded from time charts and retained only where safely displayable. |
 | Model | `providedModelName`, then `model`, then `modelId` | Normalize duplicated adjacent provider prefix for display grouping. |
@@ -136,7 +136,9 @@ No new external frontend package or CDN is introduced. Charts use semantic HTML 
 ## 7. Security and privacy
 
 - Both pages remain protected by `hermes_session_required`.
-- Langfuse calls always use the authenticated Django primary key as `userId`; browser identity parameters are ignored.
+- Langfuse calls always use `request.user.get_username()` as `userId`, matching the trusted value
+  emitted by the production Gateway; browser identity parameters are ignored. The immutable account
+  UUID and numeric Django user ID remain trusted Trace metadata rather than Langfuse's display/query key.
 - Returned observations are filtered again by exact owner before aggregation.
 - Dashboard queries omit `io` and `metadata`; no prompt, answer, tool argument, or result is embedded in analytics HTML.
 - All display strings are escaped by Django templates. Query strings and model names are bounded before use.

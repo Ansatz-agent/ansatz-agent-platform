@@ -13,7 +13,9 @@ This runbook operates the production Voice Trace stack on SSH alias `hermes`. It
 - Compose project: `ansatz-voice-trace-20260823`
 - Public routes: `/auth`, `/traces`, `/trace-ingest/v1/traces`, `/langfuse`
 - Retired route: `/agent` and every descendant return 404
-- Ordinary-user authorization key: `str(Django User.pk)`; username is display metadata only
+- Langfuse's ordinary-user query key is the authenticated Django username because the production
+  Gateway projects that trusted value into `user.id`/`langfuse.user.id`. The immutable account UUID
+  remains `ansatz.account.id`, and the numeric Django user ID remains `platform.user.id` metadata.
 
 Podman 3.3.1 retains its logical static-directory path in its database. Do not rewrite `storage.conf` to `/data`; verify the bind with:
 
@@ -122,7 +124,9 @@ Before cleanup, `rollback` stops only recorded containers, removes exact task-ow
 ## Trace authorization verification
 
 - `/traces` calls Langfuse's private `/api/public/v2/observations` API server-side.
-- Every request includes `userId=str(request.user.pk)`; session and Trace IDs are additional filters, never replacements.
+- Every request includes `userId=request.user.get_username()`; the value comes only from the
+  authenticated server-side User object. Browser identity parameters are ignored, and session and
+  Trace IDs are additional filters, never replacements.
 - Detail views apply a second local ownership filter and return 404 for foreign IDs.
 - Project API credentials remain in the auth-service environment and must never appear in browser HTML, commands, evidence, or Git.
 - A production acceptance run must use a real packaged-client conversation. Synthetic Trace tools may test transport only and must not be reported as real-conversation proof.
