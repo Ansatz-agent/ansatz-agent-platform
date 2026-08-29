@@ -1,17 +1,26 @@
 # Ansatz-agent-platform 当前进展
 
-最后更新：**2026-08-27**
+最后更新：**2026-08-29**
 
 本文件只维护当前阶段、里程碑、下一步和边界；详细证据链接到专项报告。
 
 ## 当前阶段
 
-**阶段：个人 Trace Explorer 已完成生产发布；认证连续性与 Trace 离线补传仍按专项报告中的边界等待后续发布。**
+**阶段：个人 Trace Explorer 大会话查询修复与 ClickHouse 护栏已完成生产发布；认证连续性与 Trace 离线补传仍按专项报告中的边界等待后续发布。**
+
+大会话 502/OOM 修复已发布：服务端 `main@44cb69235f` 通过惰性 IO 只加载当前选中的
+observation；平台 `main@1b7adab99a` 为 ClickHouse 默认 profile 加入 1 GiB 内存、64 MiB
+结果、35 秒和 2 线程上限及对应最大约束。生产 Auth 镜像为
+`localhost/ansatz-auth-service:main-20260829-44cb69235f`，镜像 ID 为
+`b9a322969ae1bd06ee96431d6f2e91af5e2b3237f052e8684c9592bc434b0201`。最大生产
+session（843 observations、570,830,633 bytes 事件数据）的 Session、Trace overview、4.3 MiB
+和 1.1 MiB step 均返回 200；没有新增内核 OOM。完整证据见
+[`reports/2026-08-29-bounded-trace-query-production.md`](reports/2026-08-29-bounded-trace-query-production.md)。
 
 Hermes 上 Voice Trace ClickHouse 的诊断日志失控已完成生产修复：文件日志降为 warning 并限制为 100 MiB × 3，内存/CPU/查询 profiler 关闭，Langfuse 不消费的高量 `system.*` 日志关闭并清空，保留日志设置七天 TTL。认证服务、其他 Voice Trace 容器以及主机上的其他容器均未重建。
 
-普通用户个人分析页与 session-first Trace Explorer 已部署到 Hermes：服务端远端与本地
-`main` 均为 `01c73ca1ad3ca61ee67129fd2304ad49d0778018`，生产镜像为
+普通用户个人分析页与 session-first Trace Explorer 的上一版发布基线为：服务端远端与本地
+`main@01c73ca1ad3ca61ee67129fd2304ad49d0778018`，生产镜像为
 `localhost/ansatz-auth-service:main-20260827-01c73ca1ad`，镜像 ID 为
 `4b45d69aca97042d9e6b531308d9a6dbf5b9d3721b671a57ab85f519d0193c0d`。生产账号的
 30 天 session 索引、session 详情和 trace 详情均完成真实 owner-scoped 数据验收；32 万字符级
@@ -32,6 +41,7 @@ step 的完整 Input 被限制在 420 px 内部滚动区，整页高度保持 98
 | `M-013` | Hermes ClickHouse 日志失控修复 | Done | 生产证据：`/data/ansatz-agent/voice-trace/evidence/clickhouse-logging-20260826T052311Z`；运维入口见 [`runbooks/storage-auth-personal-traces.md`](runbooks/storage-auth-personal-traces.md) |
 | `M-014` | 普通用户 Dashboard 与 Model Analytics | Done | 服务端 `main@aa4278d270` 已部署；生产真实账号 Dashboard/Model Analytics 均返回 200 |
 | `M-015` | Session-first Trace Explorer | Done | PR #7 与 #8 已合并；服务端 `main@01c73ca1ad`、生产镜像 `main-20260827-01c73ca1ad`；真实长 payload 生产验收通过 |
+| `M-016` | Bounded Trace 查询与 ClickHouse OOM 护栏 | Done | 服务端/平台 PR #9 已合并；生产镜像 `main-20260829-44cb69235f`；最大 session 与大 payload 回归、全栈健康、无新增 OOM 均通过 |
 
 ## 当前已确认设计
 
@@ -46,13 +56,13 @@ step 的完整 Input 被限制在 420 px 内部滚动区，整页高度保持 98
 ## 下一步
 
 1. 三仓最终 diff/secret 独立审阅与本地验证已经完成；交付使用报告中记录的精确 refs。
-2. 只有获得单独授权后，才 push 分支、创建 PR、合并、构建安装包或部署。
+2. 认证连续性与 Trace 离线补传仍只有获得单独授权后，才 push 分支、创建 PR、合并、构建安装包或部署。
 3. 发布阶段另做 packaged macOS/Windows 与 staging/production acceptance；不得把当前本地 Playwright/Go harness 描述成 Windows 或生产运行时验证。
-4. 持续观察 Hermes ClickHouse 日志与 `/data` 使用率；复用 `scripts/remediate-clickhouse-logging.sh` 时必须保持其 Compose 基线、业务表和全主机容器 ID 保护门槛。
+4. 持续观察 Hermes ClickHouse 日志、查询拒绝、容器重启次数与 `/data` 使用率；复用 `scripts/remediate-clickhouse-logging.sh` 时必须保持其 Compose 基线、业务表和全主机容器 ID 保护门槛。
 
 ## 已知边界
 
-- 本轮没有执行生产部署，现网不会自动获得新认证/Trace 协议。
+- 本次大会话修复已经生产部署；认证连续性与 Trace 离线补传没有随之发布，现网不会自动获得该新协议。
 - 没有完成 live Windows packaged-runtime 验收；现有 Windows 证据限于代码级、路径级和静态/自动化测试。
 - 本地 Playwright 使用受控服务，Gateway E2E 使用临时 bbolt/HTTP harness；它们证明代码契约，不证明公网或生产拓扑。
 - 三入口统一上传、真实新安装包对话、历史 Token/Cost 等既有事项不因本轮连续性实现自动关闭。
