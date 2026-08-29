@@ -86,6 +86,23 @@ all authentication data remain out of the cleanup whitelist. Never substitute
 a global Podman prune, a database drop, or direct deletion below
 `data/clickhouse`.
 
+## ClickHouse query guardrails
+
+The default profile bounds user-facing Langfuse queries to 1 GiB memory,
+64 MiB result bytes, 35 seconds, and two threads. Matching maximum constraints
+prevent a request from raising those values. The 35-second execution ceiling
+matches the setting emitted by the deployed Langfuse version; lowering the
+constraint would reject otherwise valid requests before execution.
+
+After applying `deploy/voice-trace/clickhouse/users.d/profilers.xml`, verify
+the effective defaults and the corresponding maximum constraints through
+`system.settings` and `system.settings_profile_elements`. Then run
+`bash scripts/check-voice-trace.sh` and compare ClickHouse/Langfuse restart
+counts with the pre-change evidence. A guard rejection is preferable to host
+OOM, but normal Dashboard, Session, Trace, ingest, and administrator health
+must remain green. Roll back the backed-up profile and restart only the exact
+ClickHouse container if normal queries regress.
+
 ## Deploy tested images
 
 Build auth and Gateway images on the task-scoped L40S directory, run their full tests there, export named gzip archives, and require the same SHA-256 on L40S, the local project `tmp/` directory, and Hermes. Put only owner-readable archives in `$DEPLOY_ROOT/staging`.

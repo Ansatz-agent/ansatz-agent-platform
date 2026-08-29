@@ -5,6 +5,18 @@
       <query_profiler_real_time_period_ns>0</query_profiler_real_time_period_ns>
       <query_profiler_cpu_time_period_ns>0</query_profiler_cpu_time_period_ns>
       <memory_profiler_step>0</memory_profiler_step>
+      <max_memory_usage>1073741824</max_memory_usage>
+      <max_result_bytes>67108864</max_result_bytes>
+      <result_overflow_mode>throw</result_overflow_mode>
+      <max_execution_time>35</max_execution_time>
+      <timeout_overflow_mode>throw</timeout_overflow_mode>
+      <max_threads>2</max_threads>
+      <constraints>
+        <max_memory_usage><max>1073741824</max></max_memory_usage>
+        <max_result_bytes><max>67108864</max></max_result_bytes>
+        <max_execution_time><max>35</max></max_execution_time>
+        <max_threads><max>2</max></max_threads>
+      </constraints>
     </default>
   </profiles>
 </clickhouse>

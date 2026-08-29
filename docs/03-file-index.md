@@ -41,6 +41,8 @@
 | Content-first Trace Explorer 计划 | [`superpowers/plans/2026-08-26-content-first-agent-trace-explorer.md`](superpowers/plans/2026-08-26-content-first-agent-trace-explorer.md) |
 | Session-first Trace Inspector 设计 | [`superpowers/specs/2026-08-27-session-first-trace-inspector-design.md`](superpowers/specs/2026-08-27-session-first-trace-inspector-design.md) |
 | Session-first Trace Inspector 计划 | [`superpowers/plans/2026-08-27-session-first-trace-inspector.md`](superpowers/plans/2026-08-27-session-first-trace-inspector.md) |
+| Bounded Trace query/OOM 修复设计 | [`superpowers/specs/2026-08-29-bounded-trace-query-design.md`](superpowers/specs/2026-08-29-bounded-trace-query-design.md) |
+| Bounded Trace query/OOM 修复任务书 | [`superpowers/plans/2026-08-29-bounded-trace-query-task-book.md`](superpowers/plans/2026-08-29-bounded-trace-query-task-book.md) |
 
 历史部署状态不能替代 2026-08-25 连续性分支的交付状态；新报告也不能反向证明既有生产已经运行新代码。
 
