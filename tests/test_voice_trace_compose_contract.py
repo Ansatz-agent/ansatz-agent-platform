@@ -257,6 +257,30 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
             with self.subTest(profile_setting=setting):
                 self.assertEqual(user_root.findtext(f"profiles/default/{setting}"), "0")
 
+        query_guards = {
+            "max_memory_usage": "1073741824",
+            "max_result_bytes": "67108864",
+            "max_execution_time": "35",
+            "max_threads": "2",
+        }
+        for setting, expected in query_guards.items():
+            with self.subTest(query_guard=setting):
+                self.assertEqual(
+                    user_root.findtext(f"profiles/default/{setting}"), expected
+                )
+                self.assertEqual(
+                    user_root.findtext(
+                        f"profiles/default/constraints/{setting}/max"
+                    ),
+                    expected,
+                )
+        self.assertEqual(
+            user_root.findtext("profiles/default/result_overflow_mode"), "throw"
+        )
+        self.assertEqual(
+            user_root.findtext("profiles/default/timeout_overflow_mode"), "throw"
+        )
+
         combined = CLICKHOUSE_SERVER_CONFIG_PATH.read_text() + CLICKHOUSE_USER_CONFIG_PATH.read_text()
         for forbidden in ("password", "secret", "CLICKHOUSE_PASSWORD"):
             self.assertNotIn(forbidden, combined.lower())
