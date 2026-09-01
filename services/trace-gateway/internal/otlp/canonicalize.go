@@ -3,6 +3,7 @@ package otlp
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 
 	"github.com/Ansatz-agent/ansatz-agent-platform/services/trace-gateway/internal/auth"
@@ -10,6 +11,7 @@ import (
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
 type Headers struct {
@@ -41,6 +43,7 @@ var canonicalKeys = map[string]struct{}{
 	"langfuse.observation.output":        {},
 	"langfuse.observation.model.name":    {},
 	"langfuse.observation.usage_details": {},
+	"gen_ai.usage.cost":                  {},
 	"langfuse.trace.metadata.username":   {},
 }
 
@@ -70,6 +73,7 @@ func Canonicalize(
 			if scopeSpans.Scope != nil {
 				scopeSpans.Scope.Attributes = withoutCanonical(scopeSpans.Scope.Attributes)
 			}
+			projectLogicalAccounting(scopeSpans.Spans)
 			for _, span := range scopeSpans.Spans {
 				if span == nil {
 					continue
@@ -118,6 +122,71 @@ func Canonicalize(
 	return nil
 }
 
+func projectLogicalAccounting(spans []*tracepb.Span) {
+	logical := make(map[string]*tracepb.Span)
+	for _, span := range spans {
+		if span != nil && span.Name == "hermes.logical_llm_call" && len(span.SpanId) > 0 {
+			logical[string(span.SpanId)] = span
+		}
+	}
+	if len(logical) == 0 {
+		return
+	}
+
+	latestAttempt := make(map[string]*tracepb.Span)
+	for _, span := range spans {
+		if span == nil || len(span.ParentSpanId) == 0 {
+			continue
+		}
+		parentKey := string(span.ParentSpanId)
+		if logical[parentKey] == nil {
+			continue
+		}
+		scopeType, _ := stringValue(span.Attributes, "nemo_relay.scope_type")
+		if scopeType != "llm" {
+			continue
+		}
+		current := latestAttempt[parentKey]
+		if current == nil || span.EndTimeUnixNano >= current.EndTimeUnixNano {
+			latestAttempt[parentKey] = span
+		}
+	}
+
+	for parentKey, attempt := range latestAttempt {
+		accounting := logical[parentKey]
+		if _, hasUsage := relayPayload(attempt.Attributes, "nemo_relay.end.output.usage"); !hasUsage {
+			attempt.Attributes = appendRelayAttributes(
+				attempt.Attributes,
+				accounting.Attributes,
+				"nemo_relay.end.output.usage",
+			)
+		}
+		if attributeValue(attempt.Attributes, "nemo_relay.end.output.cost_usd") == nil {
+			attempt.Attributes = appendRelayAttributes(
+				attempt.Attributes,
+				accounting.Attributes,
+				"nemo_relay.end.output.cost_usd",
+			)
+		}
+	}
+}
+
+func appendRelayAttributes(
+	target []*commonpb.KeyValue,
+	source []*commonpb.KeyValue,
+	prefix string,
+) []*commonpb.KeyValue {
+	for _, attribute := range source {
+		if attribute == nil || attribute.Value == nil {
+			continue
+		}
+		if attribute.Key == prefix || strings.HasPrefix(attribute.Key, prefix+".") {
+			target = append(target, attribute)
+		}
+	}
+	return target
+}
+
 func projectRelayForLangfuse(
 	spanName string,
 	attributes []*commonpb.KeyValue,
@@ -162,6 +231,9 @@ func projectRelayForLangfuse(
 		if usage, ok := relayUsageDetails(attributes); ok {
 			attributes = append(attributes, stringAttribute("langfuse.observation.usage_details", usage))
 		}
+		if cost, ok := relayCostUSD(attributes); ok {
+			attributes = append(attributes, doubleAttribute("gen_ai.usage.cost", cost))
+		}
 	case scopeType == "tool":
 		attributes = append(attributes, stringAttribute("langfuse.observation.type", "span"))
 		if input, ok := relayPayload(attributes, "nemo_relay.start.input"); ok {
@@ -172,6 +244,23 @@ func projectRelayForLangfuse(
 		}
 	}
 	return attributes
+}
+
+func relayCostUSD(attributes []*commonpb.KeyValue) (float64, bool) {
+	value := attributeValue(attributes, "nemo_relay.end.output.cost_usd")
+	if value == nil {
+		return 0, false
+	}
+	var cost float64
+	switch typed := value.Value.(type) {
+	case *commonpb.AnyValue_DoubleValue:
+		cost = typed.DoubleValue
+	case *commonpb.AnyValue_IntValue:
+		cost = float64(typed.IntValue)
+	default:
+		return 0, false
+	}
+	return cost, cost > 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0)
 }
 
 func normalizeModelName(model string) string {
@@ -448,5 +537,14 @@ func stringAttribute(key, value string) *commonpb.KeyValue {
 	return &commonpb.KeyValue{
 		Key:   key,
 		Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: value}},
+	}
+}
+
+func doubleAttribute(key string, value float64) *commonpb.KeyValue {
+	return &commonpb.KeyValue{
+		Key: key,
+		Value: &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_DoubleValue{DoubleValue: value},
+		},
 	}
 }
