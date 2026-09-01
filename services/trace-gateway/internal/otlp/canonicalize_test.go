@@ -113,6 +113,8 @@ func TestCanonicalizeProjectsRelayUsageIntoLangfuseGeneration(t *testing.T) {
 			Attributes: []*commonpb.KeyValue{
 				kv("nemo_relay.scope_type", "llm"),
 				kv("langfuse.observation.usage_details", `{"input":999999}`),
+				doubleKV("gen_ai.usage.cost", 999),
+				doubleKV("nemo_relay.end.output.cost_usd", 0.0125),
 				kv("nemo_relay.end.output.usage", `{
 					"prompt_tokens": 27376,
 					"completion_tokens": 2370,
@@ -141,6 +143,56 @@ func TestCanonicalizeProjectsRelayUsageIntoLangfuseGeneration(t *testing.T) {
 			"output_reasoning_tokens": 302
 		}`,
 	)
+	assertSingleDouble(
+		t,
+		request.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes,
+		"gen_ai.usage.cost",
+		0.0125,
+	)
+}
+
+func TestCanonicalizeProjectsLogicalAccountingOntoLatestPhysicalAttempt(t *testing.T) {
+	logicalID := []byte("logical1")
+	request := &collectortracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{
+			{
+				SpanId: logicalID,
+				Name:   "hermes.logical_llm_call",
+				Attributes: []*commonpb.KeyValue{
+					kv("nemo_relay.scope_type", "function"),
+					kv("nemo_relay.end.output.usage", `{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}`),
+					doubleKV("nemo_relay.end.output.cost_usd", 0.00125),
+				},
+			},
+			{
+				SpanId:          []byte("attempt1"),
+				ParentSpanId:    logicalID,
+				EndTimeUnixNano: 20,
+				Name:            "deepseek",
+				Attributes:      []*commonpb.KeyValue{kv("nemo_relay.scope_type", "llm")},
+			},
+			{
+				SpanId:          []byte("attempt2"),
+				ParentSpanId:    logicalID,
+				EndTimeUnixNano: 30,
+				Name:            "deepseek",
+				Attributes:      []*commonpb.KeyValue{kv("nemo_relay.scope_type", "llm")},
+			},
+		}}},
+	}}}
+	principal := auth.Principal{AccountID: "22222222-2222-4222-8222-222222222222", UserID: "42", Username: "wangzihe", InstallationID: "11111111-1111-4111-8111-111111111111"}
+	headers := Headers{SessionID: "session-1", Entrypoint: "desktop", RunID: "run-1", SchemaVersion: "1"}
+
+	if err := Canonicalize(request, principal, headers, "gateway-request-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	spans := request.ResourceSpans[0].ScopeSpans[0].Spans
+	if got := attributeString(spans[1].Attributes, "langfuse.observation.usage_details"); got != "" {
+		t.Fatalf("older physical attempt unexpectedly received usage: %s", got)
+	}
+	assertJSONEquivalent(t, attributeString(spans[2].Attributes, "langfuse.observation.usage_details"), `{"input":11,"output":7,"total":18}`)
+	assertSingleDouble(t, spans[2].Attributes, "gen_ai.usage.cost", 0.00125)
 }
 
 func TestCanonicalizeProjectsCompleteRelayConversationIntoLangfuse(t *testing.T) {
@@ -208,6 +260,10 @@ func intKV(key string, value int64) *commonpb.KeyValue {
 	return &commonpb.KeyValue{Key: key, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: value}}}
 }
 
+func doubleKV(key string, value float64) *commonpb.KeyValue {
+	return &commonpb.KeyValue{Key: key, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_DoubleValue{DoubleValue: value}}}
+}
+
 func attributeString(attributes []*commonpb.KeyValue, key string) string {
 	for _, attribute := range attributes {
 		if attribute.Key == key {
@@ -242,6 +298,22 @@ func assertSingle(t *testing.T, attributes []*commonpb.KeyValue, key, value stri
 			count++
 			if attribute.Value.GetStringValue() != value {
 				t.Fatalf("%s = %q, want %q", key, attribute.Value.GetStringValue(), value)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("%s count = %d, want 1", key, count)
+	}
+}
+
+func assertSingleDouble(t *testing.T, attributes []*commonpb.KeyValue, key string, value float64) {
+	t.Helper()
+	count := 0
+	for _, attribute := range attributes {
+		if attribute.Key == key {
+			count++
+			if attribute.Value.GetDoubleValue() != value {
+				t.Fatalf("%s = %v, want %v", key, attribute.Value.GetDoubleValue(), value)
 			}
 		}
 	}
