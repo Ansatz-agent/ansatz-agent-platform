@@ -1,12 +1,21 @@
 # Ansatz-agent-platform 当前进展
 
-最后更新：**2026-08-29**
+最后更新：**2026-09-01**
 
 本文件只维护当前阶段、里程碑、下一步和边界；详细证据链接到专项报告。
 
 ## 当前阶段
 
-**阶段：个人 Trace Explorer 大会话查询修复与 ClickHouse 护栏已完成生产发布；认证连续性与 Trace 离线补传仍按专项报告中的边界等待后续发布。**
+**阶段：Trace Token/Cost 计量链路与 SJTU Gateway 已完成服务端生产验收；等待外部 `wangzihe` 客户端更新后完成真实账号新 Trace 验收。**
+
+Trace accounting 修复已合并：客户端 `main@41f892309` 捕获 Relay 解码前的 provider usage，
+平台 `main@df12eda064` 将逻辑 LLM accounting 投影到最终物理 generation，个人 Trace UI
+`main@5fae11d253` 不再把缺失证据显示为真实零。生产 Gateway 镜像为
+`localhost/ansatz-trace-gateway:main-20260901-df12eda064`，镜像 ID 为
+`c77c636834b282209d96722297587c5635e2e956d23c984f873ee9a99562388a`。生产测试账号通过
+公网完整链路写入 `168` tokens 和 `$0.000321`，owner 页面返回 200 并显示 `168 tokens` /
+`$0.00032`，另一账号返回 404。完整证据和既有 17 条 `wangzihe` Trace 无法精确回填的边界见
+[`reports/2026-09-01-trace-accounting-production.md`](reports/2026-09-01-trace-accounting-production.md)。
 
 大会话 502/OOM 修复已发布：服务端 `main@44cb69235f` 通过惰性 IO 只加载当前选中的
 observation；平台 `main@1b7adab99a` 为 ClickHouse 默认 profile 加入 1 GiB 内存、64 MiB
@@ -42,6 +51,7 @@ step 的完整 Input 被限制在 420 px 内部滚动区，整页高度保持 98
 | `M-014` | 普通用户 Dashboard 与 Model Analytics | Done | 服务端 `main@aa4278d270` 已部署；生产真实账号 Dashboard/Model Analytics 均返回 200 |
 | `M-015` | Session-first Trace Explorer | Done | PR #7 与 #8 已合并；服务端 `main@01c73ca1ad`、生产镜像 `main-20260827-01c73ca1ad`；真实长 payload 生产验收通过 |
 | `M-016` | Bounded Trace 查询与 ClickHouse OOM 护栏 | Done | 服务端/平台 PR #9 已合并；生产镜像 `main-20260829-44cb69235f`；最大 session 与大 payload 回归、全栈健康、无新增 OOM 均通过 |
+| `M-017` | Trace Token/Cost accounting | Review | 客户端/平台/Auth PR #24/#11/#10 已合并；Gateway/Auth 已部署且生产测试账号完整链路通过；待 `wangzihe` 更新客户端后的新 Trace 验收 |
 
 ## 当前已确认设计
 
@@ -55,14 +65,16 @@ step 的完整 Input 被限制在 420 px 内部滚动区，整页高度保持 98
 
 ## 下一步
 
-1. 三仓最终 diff/secret 独立审阅与本地验证已经完成；交付使用报告中记录的精确 refs。
-2. 认证连续性与 Trace 离线补传仍只有获得单独授权后，才 push 分支、创建 PR、合并、构建安装包或部署。
-3. 发布阶段另做 packaged macOS/Windows 与 staging/production acceptance；不得把当前本地 Playwright/Go harness 描述成 Windows 或生产运行时验证。
-4. 持续观察 Hermes ClickHouse 日志、查询拒绝、容器重启次数与 `/data` 使用率；复用 `scripts/remediate-clickhouse-logging.sh` 时必须保持其 Compose 基线、业务表和全主机容器 ID 保护门槛。
+1. 让 `wangzihe` 的 Windows Desktop 运行正常更新流程到客户端 `main@41f892309` 或更高版本，并产生一条新对话。
+2. 在生产 ClickHouse 与 owner-scoped `/traces` 页面同时验证该新 generation 的 usage/cost 非空；不得用测试账号证据替代真实账号验收。
+3. 认证连续性与 Trace 离线补传的剩余发布边界继续按专项报告处理。
+4. 持续观察 SJTU ClickHouse 日志、查询拒绝、容器重启次数与 `/data` 使用率；任何 Gateway 重建必须同时带 base Compose 与 `docker-compose.sjtu.yml`。
 
 ## 已知边界
 
 - 本次大会话修复已经生产部署；认证连续性与 Trace 离线补传没有随之发布，现网不会自动获得该新协议。
+- 既有 17 条 `wangzihe` generation 没有 provider usage/cost 原始证据，不能精确回填；新客户端只修复更新后的调用。
+- 生产测试账号已经证明服务端链路会显示非零 Token/Cost，但 `wangzihe` 的外部 Windows 安装尚未提供更新后的新 Trace，真实账号验收仍未完成。
 - 没有完成 live Windows packaged-runtime 验收；现有 Windows 证据限于代码级、路径级和静态/自动化测试。
 - 本地 Playwright 使用受控服务，Gateway E2E 使用临时 bbolt/HTTP harness；它们证明代码契约，不证明公网或生产拓扑。
 - 三入口统一上传、真实新安装包对话、历史 Token/Cost 等既有事项不因本轮连续性实现自动关闭。

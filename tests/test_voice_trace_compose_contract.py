@@ -10,6 +10,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_PATH = ROOT / "deploy" / "voice-trace" / "docker-compose.yml"
+SJTU_COMPOSE_PATH = ROOT / "deploy" / "voice-trace" / "docker-compose.sjtu.yml"
 ENV_EXAMPLE_PATH = ROOT / "deploy" / "voice-trace" / ".env.example"
 CLICKHOUSE_SERVER_CONFIG_PATH = (
     ROOT / "deploy" / "voice-trace" / "clickhouse" / "config.d" / "logging.xml"
@@ -96,6 +97,19 @@ class VoiceTraceComposeContractTest(unittest.TestCase):
         self.assertNotIn(":latest", source)
         for name in ("postgres", "clickhouse", "redis", "minio"):
             self.assertIn("@sha256:", services[name]["image"], name)
+
+    def test_sjtu_override_publishes_only_required_loopback_ports(self) -> None:
+        self.assertTrue(SJTU_COMPOSE_PATH.is_file(), f"missing {SJTU_COMPOSE_PATH}")
+        override = yaml.safe_load(SJTU_COMPOSE_PATH.read_text(encoding="utf-8"))
+        services = override["services"]
+        self.assertEqual(
+            services,
+            {
+                "auth-service": {"ports": ["127.0.0.1:8000:8000"]},
+                "trace-gateway": {"ports": ["127.0.0.1:8080:8080"]},
+                "langfuse-web": {"ports": ["127.0.0.1:3000:3000"]},
+            },
+        )
 
     def test_networks_enforce_only_required_service_paths(self) -> None:
         source, compose = self.load_compose()

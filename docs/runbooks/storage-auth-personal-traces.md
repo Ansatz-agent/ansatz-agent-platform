@@ -1,8 +1,48 @@
 # Hermes Storage, Auth, and Personal Traces Runbook
 
-Last verified: **2026-08-26**
+Last verified: **2026-09-01**
 
-This runbook operates the production Voice Trace stack on SSH alias `hermes`. It does not cover the unrelated `cv-php8`/single-cv or Nginx Proxy Manager applications except for read-only health verification.
+The current production Voice Trace stack runs on SSH alias `sjtu` with Docker
+and stores its release under `/data/ansatz-agent/voice-trace`. The older Hermes
+Podman storage sections below remain only for rollback/history of that host and
+must not be used as SJTU deployment commands. This runbook does not authorize
+changes to unrelated host applications.
+
+## Current SJTU runtime contract
+
+- Compose project: `ansatz-voice-trace-20260823`.
+- Base Compose: `/data/ansatz-agent/voice-trace/deploy/docker-compose.yml`.
+- Required host override:
+  `/data/ansatz-agent/voice-trace/deploy/docker-compose.sjtu.yml`.
+- Owner-only environment:
+  `/data/ansatz-agent/voice-trace/secrets/server.env`.
+- Nginx reaches Auth, Trace Gateway, and Langfuse through loopback publications
+  `127.0.0.1:8000`, `127.0.0.1:8080`, and `127.0.0.1:3000` respectively.
+
+Every SJTU `docker compose config`, `up`, `run`, or service recreation must use
+both `-f` arguments. The base file intentionally has no host publications; if
+the override is omitted, the container can be healthy on its private network
+while public Nginx requests return 502.
+
+Before a mutation, render the exact service and verify its image and ports
+without printing the environment. After recreation, require all of:
+
+```bash
+rtk proxy ssh sjtu 'docker port ansatz-voice-trace-20260823-trace-gateway-1'
+rtk proxy ssh sjtu 'ss -ltnp | grep "127.0.0.1:8080"'
+rtk proxy ssh sjtu 'docker inspect --format "{{.Config.Image}} {{.State.Health.Status}} restart={{.RestartCount}} {{index .Config.Labels \"com.docker.compose.project.config_files\"}}" ansatz-voice-trace-20260823-trace-gateway-1'
+```
+
+Expected Gateway evidence includes `127.0.0.1:8080`, health `healthy`, restart
+count zero, and both Compose file paths in the label. Then test the public
+ingest route with a valid production test token; an anonymous 403 does not
+prove that Nginx can reach and complete an authenticated upload.
+
+The 2026-09-01 accounting release and the recovered port-mapping incident are
+recorded in
+[`../reports/2026-09-01-trace-accounting-production.md`](../reports/2026-09-01-trace-accounting-production.md).
+
+## Legacy Hermes runtime contract
 
 ## Runtime contract
 
@@ -33,7 +73,12 @@ From the platform repository:
 bash scripts/check-voice-trace.sh
 ```
 
-The check requires all eight platform containers to run without host-published ports, validates private Gateway/auth/Langfuse health, then requires public `/agent` 404, `/auth/login/` 200, anonymous `/traces/` 302, and `/langfuse/` 200.
+On legacy Hermes, the check requires all eight platform containers to run
+without host-published ports. On current SJTU, the host-specific override is an
+intentional exception and the three loopback-only publications above are
+required. In both environments validate private Gateway/auth/Langfuse health,
+then require public `/agent` 404, `/auth/login/` 200, anonymous `/traces/` 302,
+`/langfuse/` 200, and a valid authenticated ingest acceptance.
 
 Administrators sign in separately at `/langfuse` with a Langfuse administrator account. Ordinary users sign in at `/auth` and access only `/traces`; the two account systems are intentionally not joined by SSO in this rollout.
 
@@ -125,6 +170,22 @@ The deployment helper implements these boundaries:
 ```bash
 bash scripts/deploy-voice-trace.sh
 ```
+
+On current SJTU, do not use a helper or ad-hoc command that drops the host
+override. A single-service Gateway recreation has this exact Compose prefix:
+
+```bash
+docker compose \
+  --project-name ansatz-voice-trace-20260823 \
+  --env-file /data/ansatz-agent/voice-trace/secrets/server.env \
+  -f /data/ansatz-agent/voice-trace/deploy/docker-compose.yml \
+  -f /data/ansatz-agent/voice-trace/deploy/docker-compose.sjtu.yml \
+  up -d --no-deps --force-recreate trace-gateway
+```
+
+Run this only after the production source-of-truth, image digest, rollback
+image, environment backup, and rendered-port gates pass. Immediately verify
+the loopback listener and perform a valid authenticated Trace upload.
 
 ## Storage migration and rollback
 

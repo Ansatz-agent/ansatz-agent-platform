@@ -1,0 +1,12 @@
+services:
+  auth-service:
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  trace-gateway:
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  langfuse-web:
+    ports:
+      - "127.0.0.1:3000:3000"
