@@ -13,34 +13,6 @@ import (
 )
 
 func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
-	request := &collectortracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
-		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
-			kv("platform.user.id", "forged-resource"),
-			kv("ansatz.account.id", "forged-account"),
-			kv("langfuse.user.id", "forged-langfuse-user"),
-			kv("session.id", "forged-session"),
-			kv("langfuse.session.id", "forged-langfuse-session"),
-			kv("gen_ai.conversation.id", "forged-conversation"),
-			kv("langfuse.trace.metadata.username", "forged-username"),
-			kv("prompt", "full prompt"),
-		}},
-		ScopeSpans: []*tracepb.ScopeSpans{{
-			Scope: &commonpb.InstrumentationScope{Attributes: []*commonpb.KeyValue{
-				kv("client.installation.id", "forged-scope"),
-			}},
-			Spans: []*tracepb.Span{{
-				Name: "agent turn",
-				Attributes: []*commonpb.KeyValue{
-					kv("user.id", "forged-span"),
-					kv("tool.result", "full tool result"),
-					kv("authorization", "Bearer secret"),
-				},
-				Events: []*tracepb.Span_Event{{Attributes: []*commonpb.KeyValue{
-					kv("trace.gateway.request.id", "forged-event"),
-				}}},
-			}},
-		}},
-	}}}
 	principal := auth.Principal{
 		TokenID:        "trusted-token",
 		AccountID:      "22222222-2222-4222-8222-222222222222",
@@ -50,60 +22,88 @@ func TestCanonicalizeRemovesForgedIdentityAtEveryLevel(t *testing.T) {
 		Scope:          "trace:write",
 		Audience:       "ansatz-trace-gateway",
 	}
-	headers := Headers{SessionID: "session-1", Entrypoint: "voice", RunID: "run-1", SchemaVersion: "1"}
+	for _, entrypoint := range []string{"cli", "dashboard", "desktop"} {
+		t.Run(entrypoint, func(t *testing.T) {
+			request := forgedIdentityRequest()
+			headers := Headers{SessionID: "session-1", Entrypoint: entrypoint, RunID: "run-1", SchemaVersion: "1"}
 
-	if err := Canonicalize(request, principal, headers, "11111111-1111-4111-8111-111111111111"); err != nil {
-		t.Fatal(err)
+			if err := Canonicalize(request, principal, headers, "11111111-1111-4111-8111-111111111111"); err != nil {
+				t.Fatal(err)
+			}
+
+			resource := request.ResourceSpans[0].Resource.Attributes
+			assertSingle(t, resource, "platform.user.id", principal.UserID)
+			assertSingle(t, resource, "ansatz.account.id", principal.AccountID)
+			assertSingle(t, resource, "user.id", principal.Username)
+			assertSingle(t, resource, "langfuse.user.id", principal.Username)
+			assertSingle(t, resource, "langfuse.trace.metadata.username", "yiyuxiao")
+			assertSingle(t, resource, "client.installation.id", principal.InstallationID)
+			assertSingle(t, resource, "hermes.session.id", "session-1")
+			assertSingle(t, resource, "session.id", "session-1")
+			assertSingle(t, resource, "langfuse.session.id", "session-1")
+			assertSingle(t, resource, "gen_ai.conversation.id", "session-1")
+			assertSingle(t, resource, "hermes.entrypoint", entrypoint)
+			assertSingle(t, resource, "hermes.run.id", "run-1")
+			assertSingle(t, resource, "telemetry.schema.version", "1")
+			assertSingle(t, resource, "trace.gateway.batch.id", "11111111-1111-4111-8111-111111111111")
+
+			span := request.ResourceSpans[0].ScopeSpans[0].Spans[0]
+			assertSingle(t, span.Attributes, "user.id", principal.Username)
+			assertSingle(t, span.Attributes, "langfuse.user.id", principal.Username)
+			assertSingle(t, span.Attributes, "langfuse.trace.metadata.username", "yiyuxiao")
+			assertSingle(t, span.Attributes, "session.id", "session-1")
+			assertSingle(t, span.Attributes, "langfuse.session.id", "session-1")
+			assertSingle(t, span.Attributes, "gen_ai.conversation.id", "session-1")
+
+			all := request.String()
+			for _, forged := range []string{
+				"forged-resource", "forged-account", "forged-langfuse-user", "forged-session",
+				"forged-langfuse-session", "forged-conversation", "forged-username",
+				"forged-entrypoint-resource", "forged-scope", "forged-entrypoint-scope",
+				"forged-span", "forged-entrypoint-span", "forged-event", "forged-entrypoint-event",
+				"forged-link", "forged-entrypoint-link", "Bearer secret", "gateway-request-1",
+			} {
+				if strings.Contains(all, forged) {
+					t.Fatalf("forged/sensitive value %q survived: %s", forged, all)
+				}
+			}
+			for _, semantic := range []string{"full prompt", "full tool result"} {
+				if !strings.Contains(all, semantic) {
+					t.Fatalf("semantic value %q missing: %s", semantic, all)
+				}
+			}
+		})
 	}
+}
 
-	resource := request.ResourceSpans[0].Resource.Attributes
-	assertSingle(t, resource, "platform.user.id", principal.UserID)
-	assertSingle(t, resource, "ansatz.account.id", principal.AccountID)
-	assertSingle(t, resource, "user.id", principal.Username)
-	assertSingle(t, resource, "langfuse.user.id", principal.Username)
-	assertSingle(t, resource, "langfuse.trace.metadata.username", "yiyuxiao")
-	assertSingle(t, resource, "client.installation.id", principal.InstallationID)
-	assertSingle(t, resource, "hermes.session.id", "session-1")
-	assertSingle(t, resource, "session.id", "session-1")
-	assertSingle(t, resource, "langfuse.session.id", "session-1")
-	assertSingle(t, resource, "gen_ai.conversation.id", "session-1")
-	assertSingle(t, resource, "hermes.entrypoint", "voice")
-	assertSingle(t, resource, "hermes.run.id", "run-1")
-	assertSingle(t, resource, "telemetry.schema.version", "1")
-	assertSingle(t, resource, "trace.gateway.batch.id", "11111111-1111-4111-8111-111111111111")
-
-	span := request.ResourceSpans[0].ScopeSpans[0].Spans[0]
-	assertSingle(t, span.Attributes, "user.id", principal.Username)
-	assertSingle(t, span.Attributes, "langfuse.user.id", principal.Username)
-	assertSingle(t, span.Attributes, "langfuse.trace.metadata.username", "yiyuxiao")
-	assertSingle(t, span.Attributes, "session.id", "session-1")
-	assertSingle(t, span.Attributes, "langfuse.session.id", "session-1")
-	assertSingle(t, span.Attributes, "gen_ai.conversation.id", "session-1")
-
-	all := request.String()
-	for _, forged := range []string{
-		"forged-resource",
-		"forged-account",
-		"forged-langfuse-user",
-		"forged-session",
-		"forged-langfuse-session",
-		"forged-conversation",
-		"forged-username",
-		"forged-scope",
-		"forged-span",
-		"forged-event",
-		"Bearer secret",
-		"gateway-request-1",
-	} {
-		if strings.Contains(all, forged) {
-			t.Fatalf("forged/sensitive value %q survived: %s", forged, all)
-		}
-	}
-	for _, semantic := range []string{"full prompt", "full tool result"} {
-		if !strings.Contains(all, semantic) {
-			t.Fatalf("semantic value %q missing: %s", semantic, all)
-		}
-	}
+func forgedIdentityRequest() *collectortracepb.ExportTraceServiceRequest {
+	return &collectortracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			kv("platform.user.id", "forged-resource"), kv("ansatz.account.id", "forged-account"),
+			kv("langfuse.user.id", "forged-langfuse-user"), kv("session.id", "forged-session"),
+			kv("langfuse.session.id", "forged-langfuse-session"), kv("gen_ai.conversation.id", "forged-conversation"),
+			kv("langfuse.trace.metadata.username", "forged-username"), kv("hermes.entrypoint", "forged-entrypoint-resource"),
+			kv("prompt", "full prompt"),
+		}},
+		ScopeSpans: []*tracepb.ScopeSpans{{
+			Scope: &commonpb.InstrumentationScope{Attributes: []*commonpb.KeyValue{
+				kv("client.installation.id", "forged-scope"), kv("hermes.entrypoint", "forged-entrypoint-scope"),
+			}},
+			Spans: []*tracepb.Span{{
+				Name: "agent turn",
+				Attributes: []*commonpb.KeyValue{
+					kv("user.id", "forged-span"), kv("hermes.entrypoint", "forged-entrypoint-span"),
+					kv("tool.result", "full tool result"), kv("authorization", "Bearer secret"),
+				},
+				Events: []*tracepb.Span_Event{{Attributes: []*commonpb.KeyValue{
+					kv("trace.gateway.request.id", "forged-event"), kv("hermes.entrypoint", "forged-entrypoint-event"),
+				}}},
+				Links: []*tracepb.Span_Link{{Attributes: []*commonpb.KeyValue{
+					kv("client.installation.id", "forged-link"), kv("hermes.entrypoint", "forged-entrypoint-link"),
+				}}},
+			}},
+		}},
+	}}}
 }
 
 func TestCanonicalizeProjectsRelayUsageIntoLangfuseGeneration(t *testing.T) {
