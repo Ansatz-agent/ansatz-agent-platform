@@ -1,6 +1,6 @@
 # Ansatz-agent-platform 文件索引
 
-最后核对：**2026-09-01**
+最后核对：**2026-09-03**
 
 本文件只维护权威文档和实现入口。当前状态见 [`02-progress.md`](02-progress.md)。
 
@@ -26,6 +26,8 @@
 | 认证/Trace 连续性架构 | [`superpowers/specs/2026-08-24-auth-trace-continuity-design.md`](superpowers/specs/2026-08-24-auth-trace-continuity-design.md) |
 | 客户端/服务端认证连续性任务计划 | [`superpowers/plans/2026-08-24-authentication-continuity.md`](superpowers/plans/2026-08-24-authentication-continuity.md) |
 | 客户端 outbox 与 Gateway inbox 任务计划 | [`superpowers/plans/2026-08-24-trace-upload-continuity.md`](superpowers/plans/2026-08-24-trace-upload-continuity.md) |
+| CLI/Dashboard/Desktop 统一 Trace 设计 | [`superpowers/specs/2026-09-02-unified-client-trace-entrypoints-design.md`](superpowers/specs/2026-09-02-unified-client-trace-entrypoints-design.md) |
+| CLI/Dashboard/Desktop 统一 Trace 实施计划 | [`superpowers/plans/2026-09-02-unified-client-trace-entrypoints.md`](superpowers/plans/2026-09-02-unified-client-trace-entrypoints.md) |
 
 ## 既有生产与历史文档
 
@@ -57,10 +59,15 @@
 | 客户端 Trace outbox | `../agent-hermes-client/apps/desktop/electron/trace-outbox-store.ts`、`trace-outbox-journal.ts`、`trace-outbox-crypto.ts` |
 | 客户端 Trace forward/recovery | `../agent-hermes-client/apps/desktop/electron/trace-forwarder.ts`、`trace-recovery-controller.ts`、`trace-runtime-startup.ts` |
 | 客户端最终接线 | `../agent-hermes-client/apps/desktop/electron/main.ts` |
+| 共享 Auth Owner Trace 核心 | `../agent-hermes-client/hermes_cli/client_auth/trace/`、`hermes_cli/client_auth/runtime.py` |
+| CLI 与独立 Dashboard Trace 引导 | `../agent-hermes-client/hermes_cli/client_auth/trace/bootstrap.py`、`hermes_cli/main.py`、`cli.py` |
+| Desktop 共享 ingress lease 与旧 outbox 恢复 | `../agent-hermes-client/apps/desktop/electron/auth-bridge.ts`、`main.ts`、`trace-forwarder.ts` |
+| 三入口真实边界 E2E | `../agent-hermes-client/tests/hermes_cli/client_auth/trace/test_three_entrypoint_e2e.py` |
 | 服务端 Session/撤销/Trace token | `../agent-langfuse-server/auth-service/history/client_sessions.py`、`trace_tokens.py`、`auth_views.py` |
 | 个人 Dashboard 与 Trace Explorer | `../agent-langfuse-server/auth-service/history/trace_analytics.py`、`trace_views.py`、`templates/traces/` |
 | Gateway durable inbox | `services/trace-gateway/internal/inbox/` |
 | Gateway admission/delivery | `services/trace-gateway/internal/server/`、`services/trace-gateway/internal/delivery/` |
+| Gateway 三入口 canonicalization 契约 | `services/trace-gateway/internal/otlp/canonicalize_test.go`、`internal/server/server_test.go` |
 | Gateway Compose limits | `deploy/voice-trace/docker-compose.yml` |
 | ClickHouse log/profiler retention | `deploy/voice-trace/clickhouse/` |
 | Hermes ClickHouse bounded remediation | `scripts/remediate-clickhouse-logging.sh`、`runbooks/storage-auth-personal-traces.md` |

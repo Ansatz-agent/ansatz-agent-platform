@@ -112,35 +112,44 @@ func TestHandlerAcknowledgesOnlySyncedInboxOwnership(t *testing.T) {
 }
 
 func TestHandlerStoresCanonicalBatchUnderImmutableAccountIdentity(t *testing.T) {
-	store := &recordingStore{result: inbox.AcceptResult{BatchID: batchID, Outcome: inbox.ReceiptAccepted}}
-	handler := mustHandler(t, Config{Introspector: fakeIntrospector{}, Store: store})
-	body := validBody(t)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, validRequest(body))
-	assertSuccess(t, response, inbox.ReceiptAccepted)
+	for _, entrypoint := range []string{"cli", "dashboard", "desktop"} {
+		for _, outcome := range []inbox.ReceiptOutcome{inbox.ReceiptAccepted, inbox.ReceiptDuplicate} {
+			t.Run(entrypoint+"/"+string(outcome), func(t *testing.T) {
+				store := &recordingStore{result: inbox.AcceptResult{BatchID: batchID, Outcome: outcome}}
+				handler := mustHandler(t, Config{Introspector: fakeIntrospector{}, Store: store})
+				body := validBody(t)
+				request := validRequest(body)
+				request.Header.Set("X-Trace-Entrypoint", entrypoint)
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				assertSuccess(t, response, outcome)
 
-	envelope := store.envelope(t)
-	if envelope.AccountID != "22222222-2222-4222-8222-222222222222" {
-		t.Fatalf("account ID = %q", envelope.AccountID)
-	}
-	if envelope.SessionID != "33333333-3333-4333-8333-333333333333" || envelope.InstallationID != "44444444-4444-4444-8444-444444444444" {
-		t.Fatalf("trusted envelope identity = %+v", envelope)
-	}
-	if envelope.BatchID != batchID || envelope.PayloadSHA256 != sha256Hex(body) {
-		t.Fatalf("envelope receipt identity = %+v", envelope)
-	}
-	var exported collectortracepb.ExportTraceServiceRequest
-	if err := proto.Unmarshal(envelope.Payload, &exported); err != nil {
-		t.Fatal(err)
-	}
-	attributes := exported.ResourceSpans[0].Resource.Attributes
-	assertAttribute(t, attributes, "platform.user.id", "42")
-	assertAttribute(t, attributes, "ansatz.account.id", envelope.AccountID)
-	assertAttribute(t, attributes, "user.id", "yiyuxiao")
-	assertAttribute(t, attributes, "langfuse.user.id", "yiyuxiao")
-	assertAttribute(t, attributes, "trace.gateway.batch.id", batchID)
-	if got := exported.String(); strings.Contains(got, "request-id") {
-		t.Fatalf("mutable or request identity reached canonical payload: %s", got)
+				envelope := store.envelope(t)
+				if envelope.AccountID != "22222222-2222-4222-8222-222222222222" {
+					t.Fatalf("account ID = %q", envelope.AccountID)
+				}
+				if envelope.SessionID != "33333333-3333-4333-8333-333333333333" || envelope.InstallationID != "44444444-4444-4444-8444-444444444444" {
+					t.Fatalf("trusted envelope identity = %+v", envelope)
+				}
+				if envelope.BatchID != batchID || envelope.PayloadSHA256 != sha256Hex(body) {
+					t.Fatalf("envelope receipt identity = %+v", envelope)
+				}
+				var exported collectortracepb.ExportTraceServiceRequest
+				if err := proto.Unmarshal(envelope.Payload, &exported); err != nil {
+					t.Fatal(err)
+				}
+				attributes := exported.ResourceSpans[0].Resource.Attributes
+				assertAttribute(t, attributes, "platform.user.id", "42")
+				assertAttribute(t, attributes, "ansatz.account.id", envelope.AccountID)
+				assertAttribute(t, attributes, "user.id", "yiyuxiao")
+				assertAttribute(t, attributes, "langfuse.user.id", "yiyuxiao")
+				assertAttribute(t, attributes, "hermes.entrypoint", entrypoint)
+				assertAttribute(t, attributes, "trace.gateway.batch.id", batchID)
+				if got := exported.String(); strings.Contains(got, "request-id") {
+					t.Fatalf("mutable or request identity reached canonical payload: %s", got)
+				}
+			})
+		}
 	}
 }
 
