@@ -42,8 +42,8 @@ native auth owner 获取账号/Session/installation 绑定、Trace token、entry
 lease、OTLP ingress、AES-GCM 持久 outbox、FIFO 幂等恢复与 Gateway receipt；入口值严格为
 `cli`、`dashboard`、`desktop`，不存在缺省 Desktop 或伪造 relabel。客户端实现截止
 `50b62d28f`，Gateway 三入口规范化/receipt 契约截止 `62c1605`。Python 455 项、Desktop
-1793 项、Gateway 普通/race/vet 门禁通过；详细设计与计划见本文件索引。该结果仅表示本地实现
-与验证，**没有 push、PR、merge、installer package 或 deploy**。
+1793 项、Gateway 普通/race/vet 门禁通过；详细设计与计划见本文件索引。该结果表示已提交至
+远端 feature branch 的评审候选与本地验证，**不表示已经 merge、installer package 或 deploy**。
 
 这些变更目前只存在于本地分支，**没有 push、PR、merge、installer package 或 deploy**。已完成一次未打包的客户端 production build 与本地 Playwright 验证；现网仍以既有部署报告为准。
 
